@@ -388,7 +388,7 @@ class Historial(commands.Cog):
     reto_group = app_commands.Group(
         name="reto",
         description="Información sobre los retos literarios",
-        guild_ids=[config.GUILD_ID] if config.GUILD_ID else None,
+        guild_ids=config.GUILD_IDS if config.GUILD_IDS else None,
     )
 
     # ── /reto info ──
@@ -455,7 +455,7 @@ class Historial(commands.Cog):
     # ── /help ──
 
     @app_commands.command(name="help", description="Muestra el manual de usuario completo de Ribby")
-    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.guilds(*config.GUILD_IDS)
     async def help_command(self, interaction: discord.Interaction):
         try:
             with open("MANUAL_DE_USUARIO.md", "r", encoding="utf-8") as f:
@@ -492,7 +492,7 @@ class Historial(commands.Cog):
     # ── /admin_help ──
 
     @app_commands.command(name="admin_help", description="Muestra el manual de administradores de Ribby (solo Staff)")
-    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.guilds(*config.GUILD_IDS)
     async def admin_help_command(self, interaction: discord.Interaction):
         # Verificar rol de admin
         es_admin = any(role.name == config.ADMIN_ROLE_NAME for role in interaction.user.roles)

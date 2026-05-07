@@ -13,7 +13,11 @@ load_dotenv()
 # ─────────────────────────── Credenciales ───────────────────────────
 
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
-GUILD_ID: int = int(os.getenv("GUILD_ID", "0"))
+
+# Guild IDs: puede ser uno o varios separados por comas
+_guild_raw = os.getenv("GUILD_ID", "0")
+GUILD_IDS: list[int] = [int(g.strip()) for g in _guild_raw.split(",") if g.strip()]
+GUILD_ID: int = GUILD_IDS[0] if GUILD_IDS else 0  # Compatibilidad con código existente
 
 # Gemini: Puede ser una sola llave o una lista separada por comas
 _gemini_raw = os.getenv("GEMINI_API_KEY", "")

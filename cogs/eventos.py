@@ -59,7 +59,7 @@ class Eventos(commands.Cog):
     evento_group = app_commands.Group(
         name="evento",
         description="Gestión de eventos literarios (solo administradores)",
-        guild_ids=[config.GUILD_ID] if config.GUILD_ID else None,
+        guild_ids=config.GUILD_IDS if config.GUILD_IDS else None,
     )
 
     # ── /evento crear ──

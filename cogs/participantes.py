@@ -57,7 +57,7 @@ class Participantes(commands.Cog):
         titulo="Título de tu historia",
         usuario="(Solo admins) El usuario a registrar. Si no se indica, te registras tú mismo.",
     )
-    @app_commands.guilds(config.GUILD_ID) if config.GUILD_ID else lambda f: f
+    @app_commands.guilds(*config.GUILD_IDS) if config.GUILD_IDS else lambda f: f
     async def registrar(
         self,
         interaction: discord.Interaction,

@@ -60,10 +60,11 @@ async def on_ready():
 
     # Sincronizar slash commands con Discord
     try:
-        if config.GUILD_ID:
-            guild = discord.Object(id=config.GUILD_ID)
-            synced = await bot.tree.sync(guild=guild)
-            log.info(f"  ✅  {len(synced)} comandos sincronizados (guild {config.GUILD_ID})")
+        if config.GUILD_IDS:
+            for gid in config.GUILD_IDS:
+                guild = discord.Object(id=gid)
+                synced = await bot.tree.sync(guild=guild)
+                log.info(f"  ✅  {len(synced)} comandos sincronizados (guild {gid})")
         else:
             synced = await bot.tree.sync()
             log.info(f"  ✅  {len(synced)} comandos sincronizados (global)")

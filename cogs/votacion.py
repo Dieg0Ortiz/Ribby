@@ -105,7 +105,7 @@ class Votacion(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="votar", description="Vota por tu historia favorita del evento activo")
-    @app_commands.guilds(config.GUILD_ID) if config.GUILD_ID else lambda f: f
+    @app_commands.guilds(*config.GUILD_IDS) if config.GUILD_IDS else lambda f: f
     async def votar(self, interaction: discord.Interaction):
         activo = await database.obtener_evento_activo(self.bot.db)
 
