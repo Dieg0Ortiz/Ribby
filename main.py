@@ -107,9 +107,20 @@ async def main():
     # Arrancar el servidor web (para evitar que plataformas como Render lo apaguen)
     await start_web_server()
 
-    # Arrancar el bot
-    async with bot:
-        await bot.start(config.DISCORD_TOKEN)
+    # Arrancar el bot con reintentos automáticos
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"  🔌  Intento de conexión a Discord #{attempt}...")
+            async with bot:
+                await bot.start(config.DISCORD_TOKEN)
+        except Exception as e:
+            wait = min(30, 5 * attempt)  # 5s, 10s, 15s... hasta 30s
+            log.warning(f"  ⚠️  Conexión fallida (intento {attempt}/{max_retries}): {e}")
+            log.info(f"  ⏳  Reintentando en {wait} segundos...")
+            await asyncio.sleep(wait)
+    
+    log.error("  ❌  No se pudo conectar a Discord después de todos los intentos.")
 
 
 if __name__ == "__main__":
