@@ -1,85 +1,38 @@
 """
-database.py — Toda la lógica de SQLite para el Bot de Retos Literarios.
+database.py — Lógica de base de datos PostgreSQL (Supabase) para Ribby.
 
-Usa aiosqlite para operaciones asíncronas compatibles con discord.py.
-Todas las tablas se crean automáticamente al llamar init_db().
+Usa asyncpg para operaciones asíncronas de altísimo rendimiento.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Dict, Optional
+import logging
+from typing import Dict, Optional, Any
 
-import aiosqlite
+import asyncpg
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "literario.db")
+import config
 
+log = logging.getLogger("bot-literario.database")
 
 # ─────────────────────────── Inicialización ───────────────────────────
 
-async def init_db():
-    """Crea las tablas si no existen y retorna la conexión."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+async def init_db() -> asyncpg.Pool:
+    """Crea y retorna un pool de conexiones a PostgreSQL."""
+    if not config.DATABASE_URL:
+        log.warning("DATABASE_URL no está configurada. El bot podría no funcionar correctamente.")
+        # Retornamos un objeto dummy o lanzamos error. Mejor intentar conectar si existe.
+        pass
 
-    db = await aiosqlite.connect(DB_PATH)
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA foreign_keys=ON;")
-
-    await db.executescript("""
-        CREATE TABLE IF NOT EXISTS eventos (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre                      TEXT    NOT NULL,
-            estado                      TEXT    NOT NULL DEFAULT 'abierto',
-            fecha_creacion              TEXT    NOT NULL,
-            fecha_cierre                TEXT,
-            canal_voz_id                INTEGER,
-            canal_envio_id              INTEGER,
-            canal_respaldo_id           INTEGER,
-            duracion_narracion_minutos  REAL    DEFAULT 0,
-            timestamp_inicio_narracion  TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS participantes (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            evento_id           INTEGER NOT NULL REFERENCES eventos(id),
-            usuario_discord_id  TEXT    NOT NULL,
-            usuario_nombre      TEXT    NOT NULL,
-            titulo_historia     TEXT,
-            url_portada         TEXT,
-            url_pdf             TEXT,
-            fecha_registro      TEXT    NOT NULL,
-            UNIQUE(evento_id, usuario_discord_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS asistencia_voz (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            evento_id           INTEGER NOT NULL REFERENCES eventos(id),
-            usuario_discord_id  TEXT    NOT NULL,
-            timestamp_entrada   TEXT    NOT NULL,
-            timestamp_salida    TEXT,
-            minutos_totales     REAL    DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS votos (
-            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-            evento_id               INTEGER NOT NULL REFERENCES eventos(id),
-            votante_discord_id      TEXT    NOT NULL,
-            participante_id         INTEGER NOT NULL REFERENCES participantes(id),
-            timestamp_voto          TEXT    NOT NULL,
-            UNIQUE(evento_id, votante_discord_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS habilitados_voto (
-            evento_id           INTEGER NOT NULL REFERENCES eventos(id),
-            usuario_discord_id  TEXT    NOT NULL,
-            minutos_presencia   REAL    DEFAULT 0,
-            PRIMARY KEY (evento_id, usuario_discord_id)
-        );
-    """)
-
-    await db.commit()
-    return db
+    log.info("Conectando a PostgreSQL (Supabase)...")
+    try:
+        # statement_cache_size=0 es necesario para que funcione con el "Transaction Pooler" de Supabase
+        pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
+        return pool
+    except Exception as e:
+        log.error(f"Error conectando a la base de datos: {e}")
+        raise
 
 
 def _now() -> str:
@@ -89,297 +42,560 @@ def _now() -> str:
 
 # ─────────────────────────── Eventos ───────────────────────────
 
-async def crear_evento(db: aiosqlite.Connection, nombre: str) -> int:
+async def crear_evento(pool: asyncpg.Pool, nombre: str) -> int:
     """Crea un evento y retorna su ID."""
-    cursor = await db.execute(
-        "INSERT INTO eventos (nombre, fecha_creacion) VALUES (?, ?)",
-        (nombre, _now()),
-    )
-    await db.commit()
-    return cursor.lastrowid
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO eventos (nombre, fecha_creacion) VALUES ($1, $2) RETURNING id",
+            nombre, _now()
+        )
 
 
-async def obtener_evento_activo(db: aiosqlite.Connection):
+async def obtener_evento_activo(pool: asyncpg.Pool) -> Optional[Dict[str, Any]]:
     """Retorna el evento que NO esté cerrado (el activo). Solo uno a la vez."""
-    async with db.execute(
-        "SELECT * FROM eventos WHERE estado != 'cerrado' ORDER BY id DESC LIMIT 1"
-    ) as cursor:
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM eventos WHERE estado != 'cerrado' ORDER BY id DESC LIMIT 1"
+        )
+        return dict(row) if row else None
 
 
-async def obtener_evento_por_id(db: aiosqlite.Connection, evento_id: int):
-    """Retorna un evento por su ID."""
-    async with db.execute("SELECT * FROM eventos WHERE id = ?", (evento_id,)) as cursor:
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+async def obtener_evento_por_id(pool: asyncpg.Pool, evento_id: int) -> Optional[Dict[str, Any]]:
+    """Obtiene información de un evento por ID."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM eventos WHERE id = $1", evento_id)
+        return dict(row) if row else None
 
 
-async def configurar_evento(
-    db: aiosqlite.Connection,
+async def configurar_canales_evento(
+    pool: asyncpg.Pool,
     evento_id: int,
-    canal_voz_id: int,
-    canal_envio_id: int,
-    canal_respaldo_id: Optional[int] = None,
-):
-    """Asocia canales al evento activo."""
-    await db.execute(
-        """UPDATE eventos
-           SET canal_voz_id = ?, canal_envio_id = ?, canal_respaldo_id = ?
-           WHERE id = ?""",
-        (canal_voz_id, canal_envio_id, canal_respaldo_id, evento_id),
-    )
-    await db.commit()
+    voz_id: int,
+    envio_id: int,
+    respaldo_id: int
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE eventos SET canal_voz_id = $1, canal_envio_id = $2, canal_respaldo_id = $3 WHERE id = $4",
+            voz_id, envio_id, respaldo_id, evento_id
+        )
 
 
-async def cambiar_estado_evento(db: aiosqlite.Connection, evento_id: int, nuevo_estado: str):
-    """Cambia el estado de un evento (abierto, narrando, votando, cerrado)."""
-    extra = ""
-    params: list = [nuevo_estado]
-
-    if nuevo_estado == "narrando":
-        extra = ", timestamp_inicio_narracion = ?"
-        params.append(_now())
-    elif nuevo_estado == "cerrado":
-        extra = ", fecha_cierre = ?"
-        params.append(_now())
-
-    params.append(evento_id)
-    await db.execute(
-        f"UPDATE eventos SET estado = ?{extra} WHERE id = ?",
-        params,
-    )
-    await db.commit()
+async def actualizar_estado_evento(pool: asyncpg.Pool, evento_id: int, estado: str) -> None:
+    async with pool.acquire() as conn:
+        query = "UPDATE eventos SET estado = $1"
+        args = [estado]
+        if estado == "cerrado":
+            query += ", fecha_cierre = $2"
+            args.append(_now())
+        
+        query += f" WHERE id = ${len(args) + 1}"
+        args.append(evento_id)
+        
+        await conn.execute(query, *args)
 
 
-async def guardar_duracion_narracion(db: aiosqlite.Connection, evento_id: int, minutos: float):
-    """Guarda la duración total de la narración en minutos."""
-    await db.execute(
-        "UPDATE eventos SET duracion_narracion_minutos = ? WHERE id = ?",
-        (minutos, evento_id),
-    )
-    await db.commit()
+# ─────────────────────────── Narración ───────────────────────────
+
+async def iniciar_narracion(pool: asyncpg.Pool, evento_id: int, sesion: int) -> int:
+    """Registra el inicio de una sesión de narración y retorna su ID."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
+            evento_id, sesion, _now()
+        )
 
 
-async def obtener_eventos_cerrados(db: aiosqlite.Connection):
-    """Retorna todos los eventos cerrados para el historial."""
-    async with db.execute(
-        "SELECT * FROM eventos WHERE estado = 'cerrado' ORDER BY fecha_cierre DESC"
-    ) as cursor:
-        cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, row)) async for row in cursor]
+async def obtener_narracion_activa(pool: asyncpg.Pool, evento_id: int) -> Optional[Dict[str, Any]]:
+    """Obtiene la narración en curso (sin timestamp_fin) para el evento."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1",
+            evento_id
+        )
+        return dict(row) if row else None
+
+
+async def detener_narracion(pool: asyncpg.Pool, narracion_id: int) -> None:
+    """Cierra la narración actual calculando su duración en minutos."""
+    now_str = _now()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT timestamp_inicio, evento_id FROM narraciones WHERE id = $1", narracion_id)
+        if not row:
+            return
+            
+        t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
+        t_fin = datetime.fromisoformat(now_str)
+        duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
+
+        await conn.execute(
+            "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
+            now_str, duracion_min, narracion_id
+        )
+
+        # Actualizar total en evento
+        await conn.execute(
+            "UPDATE eventos SET duracion_narracion_minutos = duracion_narracion_minutos + $1 WHERE id = $2",
+            duracion_min, row["evento_id"]
+        )
 
 
 # ─────────────────────────── Participantes ───────────────────────────
 
 async def registrar_participante(
-    db: aiosqlite.Connection,
+    pool: asyncpg.Pool,
     evento_id: int,
-    usuario_discord_id: str,
-    usuario_nombre: str,
-    titulo_historia: Optional[str] = None,
+    discord_id: int,
+    nombre: str,
+    titulo: Optional[str] = None,
+    url_portada: Optional[str] = None,
+    url_pdf: Optional[str] = None
 ) -> int:
-    """Registra un participante. Retorna su ID."""
-    cursor = await db.execute(
-        """INSERT INTO participantes
-           (evento_id, usuario_discord_id, usuario_nombre, titulo_historia, fecha_registro)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(evento_id, usuario_discord_id)
-           DO UPDATE SET titulo_historia = COALESCE(excluded.titulo_historia, titulo_historia),
-                         usuario_nombre  = excluded.usuario_nombre""",
-        (evento_id, usuario_discord_id, usuario_nombre, titulo_historia, _now()),
-    )
-    await db.commit()
-    return cursor.lastrowid
-
-
-async def obtener_participantes(db: aiosqlite.Connection, evento_id: int):
-    """Retorna la lista de participantes de un evento."""
-    async with db.execute(
-        "SELECT * FROM participantes WHERE evento_id = ? ORDER BY id",
-        (evento_id,),
-    ) as cursor:
-        cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, row)) async for row in cursor]
-
-
-async def obtener_participante_por_usuario(
-    db: aiosqlite.Connection, evento_id: int, usuario_discord_id: str
-):
-    """Busca un participante específico."""
-    async with db.execute(
-        "SELECT * FROM participantes WHERE evento_id = ? AND usuario_discord_id = ?",
-        (evento_id, usuario_discord_id),
-    ) as cursor:
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
-
-
-async def actualizar_pdf(db: aiosqlite.Connection, participante_id: int, url_pdf: str):
-    """Actualiza la URL del PDF de un participante."""
-    await db.execute(
-        "UPDATE participantes SET url_pdf = ? WHERE id = ?",
-        (url_pdf, participante_id),
-    )
-    await db.commit()
-
-
-async def actualizar_portada(db: aiosqlite.Connection, participante_id: int, url_portada: str):
-    """Actualiza la URL de la portada de un participante."""
-    await db.execute(
-        "UPDATE participantes SET url_portada = ? WHERE id = ?",
-        (url_portada, participante_id),
-    )
-    await db.commit()
-
-
-# ─────────────────────────── Asistencia de voz ───────────────────────────
-
-async def registrar_entrada_voz(
-    db: aiosqlite.Connection, evento_id: int, usuario_discord_id: str
-):
-    """Registra la entrada de un usuario al canal de voz."""
-    await db.execute(
-        "INSERT INTO asistencia_voz (evento_id, usuario_discord_id, timestamp_entrada) VALUES (?, ?, ?)",
-        (evento_id, usuario_discord_id, _now()),
-    )
-    await db.commit()
-
-
-async def registrar_salida_voz(
-    db: aiosqlite.Connection, evento_id: int, usuario_discord_id: str
-):
-    """Registra la salida y calcula los minutos de permanencia."""
-    ahora = _now()
-    # Buscar el registro abierto más reciente
-    async with db.execute(
-        """SELECT id, timestamp_entrada FROM asistencia_voz
-           WHERE evento_id = ? AND usuario_discord_id = ? AND timestamp_salida IS NULL
-           ORDER BY id DESC LIMIT 1""",
-        (evento_id, usuario_discord_id),
-    ) as cursor:
-        row = await cursor.fetchone()
-
-    if row is None:
-        return  # No había entrada abierta
-
-    reg_id, ts_entrada = row
-    dt_entrada = datetime.fromisoformat(ts_entrada)
-    dt_salida = datetime.fromisoformat(ahora)
-    minutos = (dt_salida - dt_entrada).total_seconds() / 60.0
-
-    await db.execute(
-        "UPDATE asistencia_voz SET timestamp_salida = ?, minutos_totales = ? WHERE id = ?",
-        (ahora, round(minutos, 2), reg_id),
-    )
-    await db.commit()
-
-
-async def cerrar_sesiones_abiertas(db: aiosqlite.Connection, evento_id: int):
-    """Cierra todas las sesiones de voz que aún estén abiertas (usuario sigue en canal)."""
-    ahora = _now()
-    async with db.execute(
-        """SELECT id, timestamp_entrada, usuario_discord_id FROM asistencia_voz
-           WHERE evento_id = ? AND timestamp_salida IS NULL""",
-        (evento_id,),
-    ) as cursor:
-        abiertas = await cursor.fetchall()
-
-    for reg_id, ts_entrada, _ in abiertas:
-        dt_entrada = datetime.fromisoformat(ts_entrada)
-        dt_salida = datetime.fromisoformat(ahora)
-        minutos = (dt_salida - dt_entrada).total_seconds() / 60.0
-        await db.execute(
-            "UPDATE asistencia_voz SET timestamp_salida = ?, minutos_totales = ? WHERE id = ?",
-            (ahora, round(minutos, 2), reg_id),
+    """Registra o actualiza un participante."""
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        # PostgreSQL UPSERT logic
+        query = """
+            INSERT INTO participantes 
+                (evento_id, usuario_discord_id, usuario_nombre, titulo_historia, url_portada, url_pdf, fecha_registro)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (evento_id, usuario_discord_id) 
+            DO UPDATE SET 
+                usuario_nombre = EXCLUDED.usuario_nombre,
+                titulo_historia = EXCLUDED.titulo_historia,
+                url_portada = EXCLUDED.url_portada,
+                url_pdf = EXCLUDED.url_pdf,
+                fecha_registro = EXCLUDED.fecha_registro
+            RETURNING id
+        """
+        return await conn.fetchval(
+            query,
+            evento_id, discord_id_str, nombre, titulo, url_portada, url_pdf, _now()
         )
 
-    await db.commit()
 
-
-async def calcular_asistencia_total(db: aiosqlite.Connection, evento_id: int):
-    """Retorna un dict {usuario_discord_id: minutos_totales} con el tiempo acumulado."""
-    async with db.execute(
-        """SELECT usuario_discord_id, SUM(minutos_totales) as total
-           FROM asistencia_voz WHERE evento_id = ?
-           GROUP BY usuario_discord_id""",
-        (evento_id,),
-    ) as cursor:
-        return {row[0]: row[1] async for row in cursor}
-
-
-# ─────────────────────────── Habilitados para votar ───────────────────────────
-
-async def guardar_habilitados(
-    db: aiosqlite.Connection, evento_id: int, habilitados: Dict[str, float]
-):
-    """Guarda la lista de usuarios habilitados para votar."""
-    for uid, minutos in habilitados.items():
-        await db.execute(
-            """INSERT OR REPLACE INTO habilitados_voto
-               (evento_id, usuario_discord_id, minutos_presencia) VALUES (?, ?, ?)""",
-            (evento_id, uid, minutos),
+async def obtener_participante(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> Optional[Dict[str, Any]]:
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM participantes WHERE evento_id = $1 AND usuario_discord_id = $2",
+            evento_id, discord_id_str
         )
-    await db.commit()
+        return dict(row) if row else None
 
 
-async def esta_habilitado(
-    db: aiosqlite.Connection, evento_id: int, usuario_discord_id: str
-) -> bool:
-    """Verifica si un usuario está habilitado para votar."""
-    async with db.execute(
-        "SELECT 1 FROM habilitados_voto WHERE evento_id = ? AND usuario_discord_id = ?",
-        (evento_id, usuario_discord_id),
-    ) as cursor:
-        return await cursor.fetchone() is not None
+async def obtener_todos_participantes(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM participantes WHERE evento_id = $1 ORDER BY id ASC",
+            evento_id
+        )
+        return [dict(r) for r in rows]
 
 
-# ─────────────────────────── Votos ───────────────────────────
+# ─────────────────────────── Asistencia en Voz ───────────────────────────
 
-async def registrar_voto(
-    db: aiosqlite.Connection, evento_id: int, votante_discord_id: str, participante_id: int
-) -> bool:
-    """Registra un voto. Retorna True si se guardó, False si ya existía."""
+async def registrar_entrada_voz(pool: asyncpg.Pool, evento_id: int, discord_id, narracion_id=None) -> None:
+    """Registra cuándo entra un usuario al canal de voz."""
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 AND timestamp_salida IS NULL",
+            evento_id, discord_id_str
+        )
+        if not row:
+            await conn.execute(
+                "INSERT INTO asistencia_voz (evento_id, narracion_id, usuario_discord_id, timestamp_entrada) VALUES ($1, $2, $3, $4)",
+                evento_id, narracion_id, discord_id_str, _now()
+            )
+
+
+async def registrar_salida_voz(pool: asyncpg.Pool, evento_id: int, discord_id, narracion_id=None) -> None:
+    """Calcula y guarda el tiempo que estuvo conectado."""
+    discord_id_str = str(discord_id)
+    now_str = _now()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 AND timestamp_salida IS NULL ORDER BY id DESC LIMIT 1",
+            evento_id, discord_id_str
+        )
+        if row:
+            t_ent = datetime.fromisoformat(row["timestamp_entrada"])
+            t_sal = datetime.fromisoformat(now_str)
+            mins = (t_sal - t_ent).total_seconds() / 60.0
+
+            await conn.execute(
+                "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
+                now_str, mins, row["id"]
+            )
+
+
+async def obtener_minutos_asistencia(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> float:
+    """Suma total de minutos de un usuario en un evento."""
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT SUM(minutos_totales) FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2",
+            evento_id, discord_id_str
+        )
+        return float(val) if val else 0.0
+
+
+# ─────────────────────────── Estadísticas Globales ───────────────────────────
+
+async def contar_libros_biblioteca(pool: asyncpg.Pool) -> int:
+    """Cuenta el total histórico de cuentos/libros registrados en todas las veladas."""
+    # Como el usuario usa esto incluso cuando el bot arranca, verificamos que el pool exista
+    if not pool:
+        return 0
     try:
-        await db.execute(
-            """INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto)
-               VALUES (?, ?, ?, ?)""",
-            (evento_id, votante_discord_id, participante_id, _now()),
+        async with pool.acquire() as conn:
+            val = await conn.fetchval("SELECT COUNT(*) FROM participantes")
+            return val or 0
+    except Exception as e:
+        log.error(f"Error contando libros: {e}")
+        return 0
+
+
+async def contar_veladas_realizadas(pool: asyncpg.Pool) -> int:
+    """Cuenta el total histórico de eventos cerrados."""
+    if not pool:
+        return 0
+    try:
+        async with pool.acquire() as conn:
+            val = await conn.fetchval("SELECT COUNT(*) FROM eventos")
+            return val or 0
+    except Exception as e:
+        log.error(f"Error contando veladas: {e}")
+        return 0
+
+
+# ─────────────────────────── Votación ───────────────────────────
+
+async def registrar_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id, participante_id: int, es_valido: bool = True) -> bool:
+    votante_str = str(votante_discord_id)
+    es_valido_int = 1 if es_valido else 0
+    async with pool.acquire() as conn:
+        # Check if already voted
+        existing = await conn.fetchrow(
+            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, votante_str
         )
-        await db.commit()
+        if existing:
+            return False  # Already voted
+        await conn.execute(
+            "INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto, es_valido) VALUES ($1, $2, $3, $4, $5)",
+            evento_id, votante_str, participante_id, _now(), es_valido_int
+        )
         return True
-    except aiosqlite.IntegrityError:
-        return False
 
 
-async def ya_voto(db: aiosqlite.Connection, evento_id: int, votante_discord_id: str) -> bool:
-    """Verifica si el usuario ya votó en este evento."""
-    async with db.execute(
-        "SELECT 1 FROM votos WHERE evento_id = ? AND votante_discord_id = ?",
-        (evento_id, votante_discord_id),
-    ) as cursor:
-        return await cursor.fetchone() is not None
+async def obtener_voto_usuario(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> Optional[int]:
+    votante_str = str(votante_discord_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND es_valido = 1",
+            evento_id, votante_str
+        )
+        return row["participante_id"] if row else None
 
 
-async def obtener_resultados_votacion(db: aiosqlite.Connection, evento_id: int):
-    """Retorna los resultados de la votación ordenados por cantidad de votos."""
-    async with db.execute(
-        """SELECT p.id, p.usuario_nombre, p.titulo_historia, COUNT(v.id) as total_votos
-           FROM participantes p
-           LEFT JOIN votos v ON v.participante_id = p.id AND v.evento_id = p.evento_id
-           WHERE p.evento_id = ?
-           GROUP BY p.id
-           ORDER BY total_votos DESC""",
-        (evento_id,),
-    ) as cursor:
-        cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, row)) async for row in cursor]
+async def anular_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> bool:
+    votante_str = str(votante_discord_id)
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE votos SET es_valido = 0 WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, votante_str
+        )
+        # res looks like "UPDATE 1"
+        return res != "UPDATE 0"
+
+
+async def contar_votos(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
+    """
+    Retorna lista de participantes ordenados por votos (de mayor a menor).
+    Formato: [{'participante_id': 1, 'nombre': 'Juan', 'votos': 5}, ...]
+    """
+    async with pool.acquire() as conn:
+        query = """
+            SELECT p.id as participante_id, p.usuario_nombre as nombre, COUNT(v.id) as votos
+            FROM participantes p
+            LEFT JOIN votos v ON p.id = v.participante_id AND v.es_valido = 1
+            WHERE p.evento_id = $1
+            GROUP BY p.id, p.usuario_nombre
+            ORDER BY votos DESC, p.id ASC
+        """
+        rows = await conn.fetch(query, evento_id)
+        return [dict(r) for r in rows]
+
+
+# ─────────────────────────── Control de Fraude ───────────────────────────
+
+async def habilitar_votante(pool: asyncpg.Pool, evento_id: int, discord_id: int, minutos: float) -> None:
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        query = """
+            INSERT INTO habilitados_voto (evento_id, usuario_discord_id, minutos_presencia)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (evento_id, usuario_discord_id) 
+            DO UPDATE SET minutos_presencia = EXCLUDED.minutos_presencia
+        """
+        await conn.execute(query, evento_id, discord_id_str, minutos)
+
+
+async def incrementar_documentos_descargados(pool: asyncpg.Pool, evento_id: int, discord_id: int, participante_id: int) -> None:
+    """Registra la descarga de un documento y aumenta el contador del usuario si es un documento nuevo."""
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        # Verificar si ya lo descargó
+        row = await conn.fetchrow(
+            "SELECT 1 FROM descargas_documentos WHERE evento_id = $1 AND usuario_discord_id = $2 AND participante_id = $3",
+            evento_id, discord_id_str, participante_id
+        )
+        if not row:
+            # Registrar descarga
+            await conn.execute(
+                "INSERT INTO descargas_documentos (evento_id, usuario_discord_id, participante_id, timestamp_descarga) VALUES ($1, $2, $3, $4)",
+                evento_id, discord_id_str, participante_id, _now()
+            )
+            # Incrementar contador general
+            await conn.execute(
+                """
+                INSERT INTO habilitados_voto (evento_id, usuario_discord_id, documentos_descargados)
+                VALUES ($1, $2, 1)
+                ON CONFLICT (evento_id, usuario_discord_id) 
+                DO UPDATE SET documentos_descargados = habilitados_voto.documentos_descargados + 1
+                """,
+                evento_id, discord_id_str
+            )
+
+
+async def obtener_estatus_votante(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> Optional[Dict[str, Any]]:
+    discord_id_str = str(discord_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT minutos_presencia, documentos_descargados FROM habilitados_voto WHERE evento_id = $1 AND usuario_discord_id = $2",
+            evento_id, discord_id_str
+        )
+        return dict(row) if row else None
+
+
+# ─────────────────────────── Historial de Eventos ───────────────────────────
+
+async def obtener_ultimos_eventos(pool: asyncpg.Pool, limite: int = 5) -> list[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM eventos WHERE estado = 'cerrado' ORDER BY id DESC LIMIT $1",
+            limite
+        )
+        return [dict(r) for r in rows]
+
+
+# ─────────────────── Funciones de compatibilidad con Cogs ───────────────────
+
+# Alias: los cogs usan este nombre
+async def cambiar_estado_evento(pool, evento_id, estado):
+    return await actualizar_estado_evento(pool, evento_id, estado)
+
+
+async def obtener_participante_por_usuario(pool, evento_id, discord_id):
+    return await obtener_participante(pool, evento_id, discord_id)
+
+
+async def obtener_participantes(pool, evento_id):
+    return await obtener_todos_participantes(pool, evento_id)
+
+
+async def actualizar_pdf(pool, participante_id, url):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE participantes SET url_pdf = $1 WHERE id = $2",
+            url, participante_id
+        )
+
+
+async def actualizar_portada(pool, participante_id, url):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE participantes SET url_portada = $1 WHERE id = $2",
+            url, participante_id
+        )
+
+
+async def crear_narracion(pool, evento_id):
+    """Crea una nueva narración. Retorna (narracion_id, numero_sesion)."""
+    async with pool.acquire() as conn:
+        # Obtener el número de sesión siguiente
+        val = await conn.fetchval(
+            "SELECT COALESCE(MAX(numero_sesion), 0) + 1 FROM narraciones WHERE evento_id = $1",
+            evento_id
+        )
+        sesion = val or 1
+        nid = await conn.fetchval(
+            "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
+            evento_id, sesion, _now()
+        )
+        return nid, sesion
+
+
+async def obtener_narraciones(pool, evento_id):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM narraciones WHERE evento_id = $1 ORDER BY numero_sesion ASC",
+            evento_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def cerrar_narracion_activa(pool, evento_id):
+    """Cierra la narración activa. Retorna (narracion_id, duracion_min, numero_sesion) o None."""
+    now_str = _now()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, timestamp_inicio, numero_sesion FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1",
+            evento_id
+        )
+        if not row:
+            return None
+        t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
+        t_fin = datetime.fromisoformat(now_str)
+        duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
+        await conn.execute(
+            "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
+            now_str, duracion_min, row["id"]
+        )
+        await conn.execute(
+            "UPDATE eventos SET duracion_narracion_minutos = duracion_narracion_minutos + $1 WHERE id = $2",
+            duracion_min, evento_id
+        )
+        return row["id"], duracion_min, row["numero_sesion"]
+
+
+async def cerrar_sesiones_abiertas(pool, evento_id):
+    """Cierra todas las sesiones de voz que no tengan timestamp_salida."""
+    now_str = _now()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND timestamp_salida IS NULL",
+            evento_id
+        )
+        for row in rows:
+            t_ent = datetime.fromisoformat(row["timestamp_entrada"])
+            t_sal = datetime.fromisoformat(now_str)
+            mins = (t_sal - t_ent).total_seconds() / 60.0
+            await conn.execute(
+                "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
+                now_str, mins, row["id"]
+            )
+
+
+async def calcular_asistencia_total(pool, evento_id) -> Dict[str, float]:
+    """Retorna {discord_id: minutos_totales} para el evento."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id, SUM(minutos_totales) as total FROM asistencia_voz WHERE evento_id = $1 GROUP BY usuario_discord_id",
+            evento_id
+        )
+        return {r["usuario_discord_id"]: float(r["total"] or 0) for r in rows}
+
+
+async def guardar_duracion_total_narraciones(pool, evento_id):
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COALESCE(SUM(duracion_minutos), 0) FROM narraciones WHERE evento_id = $1",
+            evento_id
+        )
+        await conn.execute(
+            "UPDATE eventos SET duracion_narracion_minutos = $1 WHERE id = $2",
+            float(val or 0), evento_id
+        )
+
+
+async def contar_documentos_subidos(pool, evento_id) -> int:
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COUNT(*) FROM participantes WHERE evento_id = $1 AND url_pdf IS NOT NULL",
+            evento_id
+        )
+        return val or 0
+
+
+async def calcular_descargas_por_usuario(pool, evento_id) -> Dict[str, int]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id, COUNT(*) as total FROM descargas_documentos WHERE evento_id = $1 GROUP BY usuario_discord_id",
+            evento_id
+        )
+        return {r["usuario_discord_id"]: int(r["total"]) for r in rows}
+
+
+async def guardar_habilitados(pool, evento_id, habilitados_dict):
+    async with pool.acquire() as conn:
+        for uid, stats in habilitados_dict.items():
+            await conn.execute(
+                """INSERT INTO habilitados_voto (evento_id, usuario_discord_id, minutos_presencia, documentos_descargados)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (evento_id, usuario_discord_id)
+                DO UPDATE SET minutos_presencia = EXCLUDED.minutos_presencia, documentos_descargados = EXCLUDED.documentos_descargados""",
+                evento_id, uid, stats.get("minutos", 0), stats.get("descargas", 0)
+            )
+
+
+async def ya_voto(pool, evento_id, discord_id) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, str(discord_id)
+        )
+        return row is not None
+
+
+async def esta_habilitado(pool, evento_id, discord_id) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM habilitados_voto WHERE evento_id = $1 AND usuario_discord_id = $2",
+            evento_id, str(discord_id)
+        )
+        return row is not None
+
+
+async def registrar_descarga(pool, evento_id, discord_id, participante_id):
+    return await incrementar_documentos_descargados(pool, evento_id, discord_id, participante_id)
+
+
+async def obtener_resultados_votacion(pool, evento_id) -> list[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT p.usuario_nombre, p.titulo_historia, COUNT(v.id) as total_votos
+            FROM participantes p
+            LEFT JOIN votos v ON p.id = v.participante_id AND v.es_valido = 1
+            WHERE p.evento_id = $1
+            GROUP BY p.id, p.usuario_nombre, p.titulo_historia
+            ORDER BY total_votos DESC, p.id ASC""",
+            evento_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def contar_votos_totales(pool, evento_id) -> Dict[str, int]:
+    async with pool.acquire() as conn:
+        validos = await conn.fetchval(
+            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND es_valido = 1", evento_id
+        )
+        nulos = await conn.fetchval(
+            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND es_valido = 0", evento_id
+        )
+        return {"validos": validos or 0, "nulos": nulos or 0}
+
+
+async def obtener_votos_nulos(pool, evento_id) -> list[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT v.votante_discord_id, p.titulo_historia
+            FROM votos v
+            JOIN participantes p ON v.participante_id = p.id
+            WHERE v.evento_id = $1 AND v.es_valido = 0""",
+            evento_id
+        )
+        return [dict(r) for r in rows]
+

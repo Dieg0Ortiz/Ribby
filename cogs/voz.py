@@ -30,6 +30,10 @@ class Voz(commands.Cog):
         if not canal_voz_id:
             return
 
+        # Obtener la narración activa para vincular la asistencia
+        narracion = await database.obtener_narracion_activa(self.bot.db, activo["id"])
+        narracion_id = narracion["id"] if narracion else None
+
         evento_id = activo["id"]
         user_id = str(member.id)
         canal_antes = before.channel.id if before.channel else None
@@ -37,8 +41,8 @@ class Voz(commands.Cog):
 
         # Entró al canal de narración
         if canal_antes != canal_voz_id and canal_despues == canal_voz_id:
-            await database.registrar_entrada_voz(self.bot.db, evento_id, user_id)
-            log.info(f"🟢 {member.display_name} entró al canal de narración")
+            await database.registrar_entrada_voz(self.bot.db, evento_id, user_id, narracion_id)
+            log.info(f"🟢 {member.display_name} entró al canal de narración (sesión {narracion_id})")
 
         # Salió del canal de narración
         elif canal_antes == canal_voz_id and canal_despues != canal_voz_id:

@@ -14,6 +14,7 @@ Verificaciones (en orden):
 import discord
 from discord import app_commands
 from discord.ext import commands
+from datetime import datetime, timezone
 
 import config
 import database
@@ -22,25 +23,27 @@ import database
 class VotoSelect(discord.ui.Select):
     """Menú desplegable con las historias disponibles para votar."""
 
-    def __init__(self, evento_id: int, participantes: list, db):
+    def __init__(self, evento_id: int, participantes: list, db, es_valido: bool):
         self.evento_id = evento_id
         self._db = db
+        self._es_valido = es_valido
 
         options = []
         for p in participantes:
             titulo = p["titulo_historia"] or "Sin título"
             label = titulo[:100]
-            desc = f"por {p['usuario_nombre']}"[:100]
+            desc = f"✍️ por {p['usuario_nombre']}"[:100]
             options.append(
                 discord.SelectOption(
                     label=label,
                     description=desc,
                     value=str(p["id"]),
+                    emoji="📖",
                 )
             )
 
         super().__init__(
-            placeholder="Selecciona la historia que quieres votar...",
+            placeholder="📚  Selecciona la historia que quieres votar...",
             min_values=1,
             max_values=1,
             options=options,
@@ -53,20 +56,36 @@ class VotoSelect(discord.ui.Select):
             self.evento_id,
             str(interaction.user.id),
             participante_id,
+            es_valido=self._es_valido,
         )
 
         if exito:
             embed = discord.Embed(
-                title="✅ ¡Voto Registrado!",
-                description="Tu voto ha sido guardado de forma anónima. ¡Gracias por participar!",
+                title="✅  ¡Voto Registrado!",
+                description=(
+                    f"{config.SEPARADOR}\n\n"
+                    "Tu voto ha sido guardado de forma **anónima**.\n"
+                    "¡Gracias por participar en el reto!\n\n"
+                    f"{config.SEPARADOR}"
+                ),
                 color=config.COLOR_EXITO,
+                timestamp=datetime.now(timezone.utc),
             )
+            embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
+            embed.set_footer(text="COMARCALIT  •  Tu voto es privado y definitivo")
         else:
             embed = discord.Embed(
-                title="⚠️ Voto Duplicado",
-                description="Ya habías registrado tu voto para este evento.",
+                title="⚠️  Voto Duplicado",
+                description=(
+                    f"{config.SEPARADOR}\n\n"
+                    "Ya habías registrado tu voto para este evento.\n"
+                    "Solo se permite **un voto por persona**.\n\n"
+                    f"{config.SEPARADOR}"
+                ),
                 color=config.COLOR_ADVERTENCIA,
+                timestamp=datetime.now(timezone.utc),
             )
+            embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -74,9 +93,9 @@ class VotoSelect(discord.ui.Select):
 class VotoView(discord.ui.View):
     """Vista que contiene el menú de votación."""
 
-    def __init__(self, evento_id: int, participantes: list, db):
+    def __init__(self, evento_id: int, participantes: list, db, es_valido: bool):
         super().__init__(timeout=300)
-        self.add_item(VotoSelect(evento_id, participantes, db))
+        self.add_item(VotoSelect(evento_id, participantes, db, es_valido))
 
 
 class Votacion(commands.Cog):
@@ -92,50 +111,73 @@ class Votacion(commands.Cog):
 
         # Verificación 1 — Estado del evento
         if not activo or activo["estado"] != "votando":
-            return await interaction.response.send_message(
-                "❌ La votación no está abierta en este momento.", ephemeral=True
+            embed = discord.Embed(
+                description="**⛔  Votación no disponible**\n\nLa votación no está abierta en este momento.",
+                color=config.COLOR_ERROR,
             )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         user_id = str(interaction.user.id)
         evento_id = activo["id"]
 
-        # Verificación 2 — Asistencia
-        habilitado = await database.esta_habilitado(self.bot.db, evento_id, user_id)
-        if not habilitado:
-            return await interaction.response.send_message(
-                "❌ No cumpliste el requisito mínimo de asistencia en el canal de voz (70%). "
-                "No puedes votar en este evento.",
-                ephemeral=True,
-            )
-
-        # Verificación 3 — Voto duplicado
+        # Verificación 2 — Voto duplicado
         ya = await database.ya_voto(self.bot.db, evento_id, user_id)
         if ya:
-            return await interaction.response.send_message(
-                "⚠️ Ya registraste tu voto para este evento. No puedes votar de nuevo.",
-                ephemeral=True,
+            embed = discord.Embed(
+                description=(
+                    "**⚠️  Ya votaste**\n\n"
+                    "Ya registraste tu voto para este evento.\n"
+                    "No puedes votar de nuevo."
+                ),
+                color=config.COLOR_ADVERTENCIA,
             )
+            embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Verificación silenciosa — ¿Está habilitado?
+        es_valido = await database.esta_habilitado(self.bot.db, evento_id, user_id)
 
         # Obtener participantes (excluyendo al votante)
         participantes = await database.obtener_participantes(self.bot.db, evento_id)
         participantes = [p for p in participantes if p["usuario_discord_id"] != user_id]
 
         if not participantes:
-            return await interaction.response.send_message(
-                "⚠️ No hay historias disponibles para votar.", ephemeral=True
+            embed = discord.Embed(
+                description="**⚠️  Sin candidatos**\n\nNo hay historias disponibles para votar.",
+                color=config.COLOR_ADVERTENCIA,
             )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Construir lista de historias
+        historias_lista = []
+        for i, p in enumerate(participantes, 1):
+            titulo = p["titulo_historia"] or "Sin título"
+            historias_lista.append(f"`{i}.`  **{titulo}**  —  *{p['usuario_nombre']}*")
 
         embed = discord.Embed(
-            title="🗳️ Votación",
+            title="🗳️  Votación",
             description=(
-                f"**{activo['nombre']}**\n\n"
-                "Selecciona la historia que quieres votar en el menú de abajo.\n"
-                "Tu voto es **anónimo** y **definitivo**."
+                f"{config.SEPARADOR}\n\n"
+                f"📖  **{activo['nombre']}**\n\n"
+                "Selecciona la historia que más te gustó\n"
+                "en el menú desplegable de abajo.\n\n"
+                f"{config.SEPARADOR_CORTO}\n\n"
+                + "\n".join(historias_lista)
+                + f"\n\n{config.SEPARADOR}"
             ),
-            color=config.COLOR_PRINCIPAL,
+            color=config.COLOR_VOTACION,
+            timestamp=datetime.now(timezone.utc),
         )
+        embed.add_field(
+            name="⚠️  Importante",
+            value="Tu voto es **anónimo** y **definitivo**. No podrás cambiarlo.",
+            inline=False,
+        )
+        embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="COMARCALIT  •  Retos Literarios  •  Elige sabiamente")
 
-        view = VotoView(evento_id, participantes, self.bot.db)
+        view = VotoView(evento_id, participantes, self.bot.db, es_valido)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 

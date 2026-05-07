@@ -46,6 +46,7 @@ COGS = [
     "cogs.voz",
     "cogs.votacion",
     "cogs.historial",
+    "cogs.saludos",
 ]
 
 
