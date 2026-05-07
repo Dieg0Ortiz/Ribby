@@ -80,8 +80,8 @@ class GeminiProvider(AIProvider):
 class GroqProvider(AIProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Usamos Llama 3 8B por su tremenda velocidad
-        self.model_name = "llama3-8b-8192"
+        # Llama 3.3 70B es el modelo gratuito más potente en Groq actualmente
+        self.model_name = "llama-3.3-70b-versatile"
         self.url = "https://api.groq.com/openai/v1/chat/completions"
 
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
@@ -117,8 +117,8 @@ class GroqProvider(AIProvider):
 class OpenRouterProvider(AIProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Usamos un modelo gratuito de OpenRouter
-        self.model_name = "meta-llama/llama-3-8b-instruct:free"
+        # Modelo gratuito de OpenRouter
+        self.model_name = "meta-llama/llama-3.1-8b-instruct:free"
         self.url = "https://openrouter.ai/api/v1/chat/completions"
 
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
