@@ -71,6 +71,24 @@ async def on_ready():
         log.error(f"  ❌  Error al sincronizar comandos: {e}")
 
 
+import os
+from aiohttp import web
+
+async def handle_ping(request):
+    return web.Response(text="Ribby is alive and listening!")
+
+async def start_web_server():
+    """Inicia un servidor web dummy para mantener vivo el proceso en servicios gratuitos (Render, Koyeb, etc.)."""
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    log.info(f"  🌐  Servidor web iniciado en el puerto {port}")
+
+
 async def main():
     """Función principal asíncrona."""
     # Inicializar la base de datos
@@ -84,6 +102,9 @@ async def main():
             log.info(f"  📦  Cog cargado: {cog}")
         except Exception as e:
             log.error(f"  ❌  Error cargando {cog}: {e}")
+
+    # Arrancar el servidor web (para evitar que plataformas como Render lo apaguen)
+    await start_web_server()
 
     # Arrancar el bot
     async with bot:
