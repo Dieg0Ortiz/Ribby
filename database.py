@@ -35,8 +35,13 @@ async def init_db() -> asyncpg.Pool:
         raise
 
 
-def _now() -> str:
-    """Timestamp UTC en formato ISO 8601."""
+def _now() -> datetime:
+    """Retorna el timestamp UTC actual como objeto datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _now_iso() -> str:
+    """Retorna el timestamp UTC actual en formato ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -47,7 +52,7 @@ async def crear_evento(pool: asyncpg.Pool, nombre: str) -> int:
     async with pool.acquire() as conn:
         return await conn.fetchval(
             "INSERT INTO eventos (nombre, fecha_creacion) VALUES ($1, $2) RETURNING id",
-            nombre, _now()
+            nombre, _now_iso()
         )
 
 
@@ -87,7 +92,7 @@ async def actualizar_estado_evento(pool: asyncpg.Pool, evento_id: int, estado: s
         args = [estado]
         if estado == "cerrado":
             query += ", fecha_cierre = $2"
-            args.append(_now())
+            args.append(_now_iso())
         
         query += f" WHERE id = ${len(args) + 1}"
         args.append(evento_id)
@@ -102,7 +107,7 @@ async def iniciar_narracion(pool: asyncpg.Pool, evento_id: int, sesion: int) -> 
     async with pool.acquire() as conn:
         return await conn.fetchval(
             "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
-            evento_id, sesion, _now()
+            evento_id, sesion, _now_iso()
         )
 
 
@@ -118,19 +123,20 @@ async def obtener_narracion_activa(pool: asyncpg.Pool, evento_id: int) -> Option
 
 async def detener_narracion(pool: asyncpg.Pool, narracion_id: int) -> None:
     """Cierra la narración actual calculando su duración en minutos."""
-    now_str = _now()
+    now_dt = _now()
+    now_iso = now_dt.isoformat()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT timestamp_inicio, evento_id FROM narraciones WHERE id = $1", narracion_id)
         if not row:
             return
             
         t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
-        t_fin = datetime.fromisoformat(now_str)
+        t_fin = now_dt
         duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
 
         await conn.execute(
             "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
-            now_str, duracion_min, narracion_id
+            now_iso, duracion_min, narracion_id
         )
 
         # Actualizar total en evento
@@ -170,7 +176,7 @@ async def registrar_participante(
         """
         return await conn.fetchval(
             query,
-            evento_id, discord_id_str, nombre, titulo, url_portada, url_pdf, _now()
+            evento_id, discord_id_str, nombre, titulo, url_portada, url_pdf, _now_iso()
         )
 
 
@@ -206,14 +212,15 @@ async def registrar_entrada_voz(pool: asyncpg.Pool, evento_id: int, discord_id, 
         if not row:
             await conn.execute(
                 "INSERT INTO asistencia_voz (evento_id, narracion_id, usuario_discord_id, timestamp_entrada) VALUES ($1, $2, $3, $4)",
-                evento_id, narracion_id, discord_id_str, _now()
+                evento_id, narracion_id, discord_id_str, _now_iso()
             )
 
 
 async def registrar_salida_voz(pool: asyncpg.Pool, evento_id: int, discord_id, narracion_id=None) -> None:
     """Calcula y guarda el tiempo que estuvo conectado."""
     discord_id_str = str(discord_id)
-    now_str = _now()
+    now_dt = _now()
+    now_iso = now_dt.isoformat()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 AND timestamp_salida IS NULL ORDER BY id DESC LIMIT 1",
@@ -221,12 +228,12 @@ async def registrar_salida_voz(pool: asyncpg.Pool, evento_id: int, discord_id, n
         )
         if row:
             t_ent = datetime.fromisoformat(row["timestamp_entrada"])
-            t_sal = datetime.fromisoformat(now_str)
+            t_sal = now_dt
             mins = (t_sal - t_ent).total_seconds() / 60.0
 
             await conn.execute(
                 "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
-                now_str, mins, row["id"]
+                now_iso, mins, row["id"]
             )
 
 
@@ -285,7 +292,7 @@ async def registrar_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id,
             return False  # Already voted
         await conn.execute(
             "INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto, es_valido) VALUES ($1, $2, $3, $4, $5)",
-            evento_id, votante_str, participante_id, _now(), es_valido_int
+            evento_id, votante_str, participante_id, _now_iso(), es_valido_int
         )
         return True
 
@@ -356,7 +363,7 @@ async def incrementar_documentos_descargados(pool: asyncpg.Pool, evento_id: int,
             # Registrar descarga
             await conn.execute(
                 "INSERT INTO descargas_documentos (evento_id, usuario_discord_id, participante_id, timestamp_descarga) VALUES ($1, $2, $3, $4)",
-                evento_id, discord_id_str, participante_id, _now()
+                evento_id, discord_id_str, participante_id, _now_iso()
             )
             # Incrementar contador general
             await conn.execute(
@@ -433,7 +440,7 @@ async def crear_narracion(pool, evento_id):
         sesion = val or 1
         nid = await conn.fetchval(
             "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
-            evento_id, sesion, _now()
+            evento_id, sesion, _now_iso()
         )
         return nid, sesion
 
@@ -449,7 +456,8 @@ async def obtener_narraciones(pool, evento_id):
 
 async def cerrar_narracion_activa(pool, evento_id):
     """Cierra la narración activa. Retorna (narracion_id, duracion_min, numero_sesion) o None."""
-    now_str = _now()
+    now_dt = _now()
+    now_iso = now_dt.isoformat()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, timestamp_inicio, numero_sesion FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1",
@@ -458,11 +466,11 @@ async def cerrar_narracion_activa(pool, evento_id):
         if not row:
             return None
         t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
-        t_fin = datetime.fromisoformat(now_str)
+        t_fin = now_dt
         duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
         await conn.execute(
             "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
-            now_str, duracion_min, row["id"]
+            now_iso, duracion_min, row["id"]
         )
         await conn.execute(
             "UPDATE eventos SET duracion_narracion_minutos = duracion_narracion_minutos + $1 WHERE id = $2",
@@ -473,7 +481,8 @@ async def cerrar_narracion_activa(pool, evento_id):
 
 async def cerrar_sesiones_abiertas(pool, evento_id):
     """Cierra todas las sesiones de voz que no tengan timestamp_salida."""
-    now_str = _now()
+    now_dt = _now()
+    now_iso = now_dt.isoformat()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND timestamp_salida IS NULL",
@@ -481,11 +490,11 @@ async def cerrar_sesiones_abiertas(pool, evento_id):
         )
         for row in rows:
             t_ent = datetime.fromisoformat(row["timestamp_entrada"])
-            t_sal = datetime.fromisoformat(now_str)
+            t_sal = now_dt
             mins = (t_sal - t_ent).total_seconds() / 60.0
             await conn.execute(
                 "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
-                now_str, mins, row["id"]
+                now_iso, mins, row["id"]
             )
 
 
@@ -599,3 +608,38 @@ async def obtener_votos_nulos(pool, evento_id) -> list[Dict[str, Any]]:
         )
         return [dict(r) for r in rows]
 
+
+# ─────────────────────────── Memoria de Ribby ───────────────────────────
+
+async def obtener_memoria_usuario(pool: asyncpg.Pool, discord_id: int) -> Optional[Dict[str, Any]]:
+    """Carga el resumen de memoria de un usuario. Retorna None si no existe."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM ribby_memoria WHERE usuario_discord_id = $1",
+            str(discord_id)
+        )
+        return dict(row) if row else None
+
+
+async def guardar_memoria_usuario(
+    pool: asyncpg.Pool,
+    discord_id: int,
+    resumen: str,
+    mood: str,
+    interacciones: int,
+) -> None:
+    """Crea o actualiza el resumen de memoria de un usuario (upsert)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ribby_memoria (usuario_discord_id, resumen, mood, interacciones, ultima_actualizacion)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (usuario_discord_id)
+            DO UPDATE SET
+                resumen = EXCLUDED.resumen,
+                mood = EXCLUDED.mood,
+                interacciones = EXCLUDED.interacciones,
+                ultima_actualizacion = EXCLUDED.ultima_actualizacion
+            """,
+            str(discord_id), resumen, mood, interacciones, _now_iso()
+        )

@@ -6,14 +6,21 @@ Comandos:
   /reto historial — Lista eventos cerrados. Al seleccionar uno, muestra detalles.
 """
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime, timezone
 
 import config
 import database
 import personalidad as ribby
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MANUAL_USUARIO_PATH = BASE_DIR / "MANUAL_DE_USUARIO.md"
+MANUAL_ADMIN_PATH = BASE_DIR / "MANUAL_ADMINISTRADORES.md"
 
 
 # ─────────────────────────── Constantes visuales ───────────────────────────
@@ -458,7 +465,7 @@ class Historial(commands.Cog):
     @app_commands.guilds(*config.GUILD_IDS)
     async def help_command(self, interaction: discord.Interaction):
         try:
-            with open("MANUAL_DE_USUARIO.md", "r", encoding="utf-8") as f:
+            with MANUAL_USUARIO_PATH.open("r", encoding="utf-8") as f:
                 contenido = f.read()
         except FileNotFoundError:
             return await interaction.response.send_message(
@@ -505,7 +512,7 @@ class Historial(commands.Cog):
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         try:
-            with open("MANUAL_ADMINISTRADORES.md", "r", encoding="utf-8") as f:
+            with MANUAL_ADMIN_PATH.open("r", encoding="utf-8") as f:
                 contenido = f.read()
         except FileNotFoundError:
             return await interaction.response.send_message(

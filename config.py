@@ -59,6 +59,21 @@ COLOR_VOTACION: int    = 0x6366F1   # Índigo — para votación
 BOT_NAME: str = "Ribby 🎀"
 BOT_ICON_URL: str = ""  # URL de ícono del bot (opcional, se puede llenar)
 
+# ─────────────────────────── Typing Indicator ───────────────────────────
+
+def _as_bool(value: str, default: bool = False) -> bool:
+	raw = (value or "").strip().lower()
+	if not raw:
+		return default
+	return raw in {"1", "true", "yes", "y", "on", "si", "sí"}
+
+# Recomendado en producción: desactivado para evitar 429 en /typing.
+ENABLE_TYPING_INDICATOR: bool = _as_bool(os.getenv("ENABLE_TYPING_INDICATOR", "0"), False)
+
+# En caso de activar typing, enfriamientos para reducir reintentos al recibir 429.
+TYPING_COOLDOWN_SECONDS: int = int(os.getenv("TYPING_COOLDOWN_SECONDS", "600"))
+TYPING_GLOBAL_COOLDOWN_SECONDS: int = int(os.getenv("TYPING_GLOBAL_COOLDOWN_SECONDS", "600"))
+
 # Separadores visuales para embeds
 SEPARADOR: str = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 SEPARADOR_CORTO: str = "─────────────────"

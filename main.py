@@ -62,9 +62,12 @@ async def on_ready():
     try:
         if config.GUILD_IDS:
             for gid in config.GUILD_IDS:
-                guild = discord.Object(id=gid)
-                synced = await bot.tree.sync(guild=guild)
-                log.info(f"  ✅  {len(synced)} comandos sincronizados (guild {gid})")
+                try:
+                    guild = discord.Object(id=gid)
+                    synced = await bot.tree.sync(guild=guild)
+                    log.info(f"  ✅  {len(synced)} comandos sincronizados (guild {gid})")
+                except Exception as ge:
+                    log.warning(f"  ⚠️  No access syncing commands for guild {gid}: {ge}")
         else:
             synced = await bot.tree.sync()
             log.info(f"  ✅  {len(synced)} comandos sincronizados (global)")
