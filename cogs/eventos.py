@@ -233,6 +233,8 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
+        await interaction.response.defer()
+
         # Crear nueva sesión de narración
         narracion_id, numero_sesion = await database.crear_narracion(self.bot.db, activo["id"])
 
@@ -293,7 +295,7 @@ class Eventos(commands.Cog):
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_footer(text=ribby.tip_aleatorio())
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     # ── /evento cerrar_narracion ──
 

@@ -609,6 +609,169 @@ async def obtener_votos_nulos(pool, evento_id) -> list[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+# ─────────────────────────── Documentos Persistentes ───────────────────────────
+
+async def guardar_documento(
+    pool: asyncpg.Pool,
+    participante_id: int,
+    evento_id: int,
+    usuario_discord_id: str,
+    tipo: str,  # 'pdf' | 'portada'
+    url_discord: str,
+    url_respaldo: str = None,
+    nombre_archivo: str = None,
+    content_type: str = None,
+    tamanio_bytes: int = None,
+) -> str:
+    """
+    Inserta o actualiza el documento de un participante.
+    Incrementa el número de versión en cada actualización.
+    Retorna la url_activa (respaldo si existe, discord si no).
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO documentos_participantes
+                (participante_id, evento_id, usuario_discord_id, tipo,
+                 url_discord, url_respaldo, nombre_archivo, content_type,
+                 tamanio_bytes, version, fecha_subida)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, NOW())
+            ON CONFLICT (participante_id, tipo)
+            DO UPDATE SET
+                url_discord       = EXCLUDED.url_discord,
+                url_respaldo      = COALESCE(EXCLUDED.url_respaldo, documentos_participantes.url_respaldo),
+                nombre_archivo    = COALESCE(EXCLUDED.nombre_archivo, documentos_participantes.nombre_archivo),
+                content_type      = COALESCE(EXCLUDED.content_type, documentos_participantes.content_type),
+                tamanio_bytes     = COALESCE(EXCLUDED.tamanio_bytes, documentos_participantes.tamanio_bytes),
+                version           = documentos_participantes.version + 1,
+                fecha_actualizacion = NOW()
+            RETURNING url_activa
+            """,
+            participante_id, evento_id, usuario_discord_id, tipo,
+            url_discord, url_respaldo, nombre_archivo, content_type, tamanio_bytes,
+        )
+
+        url_activa = row["url_activa"] if row else url_respaldo or url_discord
+
+        # Sincronizar con la tabla participantes para compatibilidad con código existente
+        if tipo == "pdf":
+            await conn.execute(
+                "UPDATE participantes SET url_pdf = $1 WHERE id = $2",
+                url_activa, participante_id,
+            )
+        elif tipo == "portada":
+            await conn.execute(
+                "UPDATE participantes SET url_portada = $1 WHERE id = $2",
+                url_activa, participante_id,
+            )
+
+        return url_activa
+
+
+async def obtener_documento(
+    pool: asyncpg.Pool,
+    participante_id: int,
+    tipo: str,  # 'pdf' | 'portada'
+) -> Optional[Dict[str, Any]]:
+    """Retorna el documento activo de un participante."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT url_activa, url_discord, url_respaldo,
+                   nombre_archivo, version, fecha_subida
+            FROM documentos_participantes
+            WHERE participante_id = $1 AND tipo = $2
+            """,
+            participante_id, tipo,
+        )
+        return dict(row) if row else None
+
+
+async def obtener_documentos_evento(
+    pool: asyncpg.Pool,
+    evento_id: int,
+    tipo: str = None,  # None = todos, 'pdf' | 'portada'
+) -> list[Dict[str, Any]]:
+    """Retorna todos los documentos de un evento, opcionalmente filtrados por tipo."""
+    async with pool.acquire() as conn:
+        if tipo:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM v_documentos_completos
+                WHERE evento_id = $1 AND tipo = $2
+                ORDER BY participante_id ASC
+                """,
+                evento_id, tipo,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM v_documentos_completos
+                WHERE evento_id = $1
+                ORDER BY participante_id ASC, tipo ASC
+                """,
+                evento_id,
+            )
+        return [dict(r) for r in rows]
+
+
+async def actualizar_url_respaldo_documento(
+    pool: asyncpg.Pool,
+    participante_id: int,
+    tipo: str,
+    url_respaldo: str,
+) -> None:
+    """
+    Actualiza solo la URL de respaldo de un documento ya guardado.
+    Útil cuando el reenvío al canal privado tarda o falla inicialmente.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE documentos_participantes
+            SET url_respaldo = $1, fecha_actualizacion = NOW()
+            WHERE participante_id = $2 AND tipo = $3
+            """,
+            url_respaldo, participante_id, tipo,
+        )
+        # Sincronizar participantes con la nueva url_activa
+        row = await conn.fetchrow(
+            "SELECT url_activa FROM documentos_participantes WHERE participante_id = $1 AND tipo = $2",
+            participante_id, tipo,
+        )
+        if row:
+            col = "url_pdf" if tipo == "pdf" else "url_portada"
+            await conn.execute(
+                f"UPDATE participantes SET {col} = $1 WHERE id = $2",
+                row["url_activa"], participante_id,
+            )
+
+
+async def sincronizar_urls_desde_documentos(pool: asyncpg.Pool, evento_id: int) -> int:
+    """
+    Utilidad de mantenimiento: recorre documentos_participantes y actualiza
+    la tabla participantes con las url_activa más recientes.
+    Útil para ejecutar después de un reinicio si hay desincronización.
+    Retorna el número de filas actualizadas.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT participante_id, tipo, url_activa FROM documentos_participantes WHERE evento_id = $1",
+            evento_id,
+        )
+        updated = 0
+        for row in rows:
+            if not row["url_activa"]:
+                continue
+            col = "url_pdf" if row["tipo"] == "pdf" else "url_portada"
+            result = await conn.execute(
+                f"UPDATE participantes SET {col} = $1 WHERE id = $2",
+                row["url_activa"], row["participante_id"],
+            )
+            if result != "UPDATE 0":
+                updated += 1
+        return updated
+
 # ─────────────────────────── Memoria de Ribby ───────────────────────────
 
 async def obtener_memoria_usuario(pool: asyncpg.Pool, discord_id: int) -> Optional[Dict[str, Any]]:

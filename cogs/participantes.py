@@ -207,53 +207,68 @@ class Participantes(commands.Cog):
             filename = attachment.filename.lower()
             log.info(f"   ↳ Archivo: {attachment.filename} ({attachment.content_type})")
 
-            # Detectar documentos (PDF, DOCX, DOC)
-            if any(filename.endswith(ext) for ext in EXTENSIONES_DOCUMENTO):
-                url_guardada = attachment.url
+            es_documento = any(filename.endswith(ext) for ext in EXTENSIONES_DOCUMENTO)
+            es_imagen    = any(filename.endswith(ext) for ext in EXTENSIONES_IMAGEN)
 
-                # Reenviar al canal de respaldo si está configurado
-                if activo["canal_respaldo_id"]:
-                    canal_respaldo = self.bot.get_channel(activo["canal_respaldo_id"])
-                    if canal_respaldo:
-                        try:
-                            file = await attachment.to_file()
-                            msg_respaldo = await canal_respaldo.send(
-                                content=f"📄 Documento de **{message.author.display_name}** — Evento: {activo['nombre']}",
-                                file=file,
-                            )
-                            if msg_respaldo.attachments:
-                                url_guardada = msg_respaldo.attachments[0].url
-                        except Exception as e:
-                            log.warning(f"   ↳ Error al respaldar documento: {e}")
-
-                await database.actualizar_pdf(self.bot.db, participante["id"], url_guardada)
-                archivos_procesados.append(("📄", "Documento", attachment.filename))
-                log.info(f"   ✅ Documento guardado para {message.author.display_name}")
-
-            # Detectar imágenes de portada
-            elif any(filename.endswith(ext) for ext in EXTENSIONES_IMAGEN):
-                url_guardada = attachment.url
-
-                # Reenviar al canal de respaldo
-                if activo["canal_respaldo_id"]:
-                    canal_respaldo = self.bot.get_channel(activo["canal_respaldo_id"])
-                    if canal_respaldo:
-                        try:
-                            file = await attachment.to_file()
-                            msg_respaldo = await canal_respaldo.send(
-                                content=f"🖼️ Portada de **{message.author.display_name}** — Evento: {activo['nombre']}",
-                                file=file,
-                            )
-                            if msg_respaldo.attachments:
-                                url_guardada = msg_respaldo.attachments[0].url
-                        except Exception as e:
-                            log.warning(f"   ↳ Error al respaldar portada: {e}")
-
-                await database.actualizar_portada(self.bot.db, participante["id"], url_guardada)
-                archivos_procesados.append(("🖼️", "Portada", attachment.filename))
-                log.info(f"   ✅ Portada guardada para {message.author.display_name}")
-            else:
+            if not es_documento and not es_imagen:
                 log.info(f"   ↳ Archivo ignorado (tipo no reconocido): {attachment.filename}")
+                continue
+
+            tipo       = "pdf"      if es_documento else "portada"
+            etiqueta   = "Documento" if es_documento else "Portada"
+            emoji_tipo = "📄"        if es_documento else "🖼️"
+
+            # --- URL primaria: la que llega directamente de Discord ---
+            url_discord = attachment.url
+
+            # --- URL de respaldo: reenvío al canal privado (más estable) ---
+            url_respaldo = None
+            if activo["canal_respaldo_id"]:
+                canal_respaldo = self.bot.get_channel(activo["canal_respaldo_id"])
+                if canal_respaldo:
+                    try:
+                        file = await attachment.to_file()
+                        prefijo = "📄 Documento" if es_documento else "🖼️ Portada"
+                        msg_respaldo = await canal_respaldo.send(
+                            content=(
+                                f"{prefijo} de **{message.author.display_name}** "
+                                f"— Evento: {activo['nombre']}"
+                            ),
+                            file=file,
+                        )
+                        if msg_respaldo.attachments:
+                            url_respaldo = msg_respaldo.attachments[0].url
+                    except Exception as e:
+                        log.warning(f"   ↳ Error al respaldar {etiqueta.lower()}: {e}")
+
+            # --- Persistir en documentos_participantes y sincronizar con participantes ---
+            try:
+                url_activa = await database.guardar_documento(
+                    pool               = self.bot.db,
+                    participante_id    = participante["id"],
+                    evento_id          = activo["id"],
+                    usuario_discord_id = str(message.author.id),
+                    tipo               = tipo,
+                    url_discord        = url_discord,
+                    url_respaldo       = url_respaldo,
+                    nombre_archivo     = attachment.filename,
+                    content_type       = attachment.content_type,
+                    tamanio_bytes      = attachment.size,
+                )
+                log.info(
+                    f"   ✅ {etiqueta} persistido para {message.author.display_name} "
+                    f"(url={'respaldo' if url_respaldo else 'discord'})"
+                )
+            except Exception as e:
+                # Fallback: si falla la tabla nueva, al menos actualizar participantes directamente
+                log.error(f"   ❌ Error persistiendo en documentos_participantes: {e}")
+                url_activa = url_respaldo or url_discord
+                if tipo == "pdf":
+                    await database.actualizar_pdf(self.bot.db, participante["id"], url_activa)
+                else:
+                    await database.actualizar_portada(self.bot.db, participante["id"], url_activa)
+
+            archivos_procesados.append((emoji_tipo, etiqueta, attachment.filename))
 
         # Confirmar al usuario con un embed bonito
         if archivos_procesados:
@@ -261,19 +276,17 @@ class Participantes(commands.Cog):
             libros = await database.contar_libros_biblioteca(self.bot.db)
 
             # Elegir frase según tipo de archivo
-            tiene_doc = any(t == "Documento" for _, t, _ in archivos_procesados)
-            tiene_portada = any(t == "Portada" for _, t, _ in archivos_procesados)
+            tiene_doc     = any(t == "Documento" for _, t, _ in archivos_procesados)
+            tiene_portada = any(t == "Portada"   for _, t, _ in archivos_procesados)
 
-            if tiene_doc and tiene_portada:
-                frase = ribby.frase(ribby.NUEVO_LIBRO, libros=libros)
-            elif tiene_doc:
+            if tiene_doc:
                 frase = ribby.frase(ribby.NUEVO_LIBRO, libros=libros)
             else:
                 frase = ribby.frase(ribby.NUEVA_PORTADA)
 
             desc_lineas = []
-            for emoji, tipo, nombre in archivos_procesados:
-                desc_lineas.append(f"{emoji}  **{tipo}**  →  `{nombre}`")
+            for emoji, tipo_label, nombre in archivos_procesados:
+                desc_lineas.append(f"{emoji}  **{tipo_label}**  →  `{nombre}`")
 
             embed = discord.Embed(
                 title="✅  Archivos Recibidos",
