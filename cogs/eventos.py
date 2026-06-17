@@ -193,6 +193,76 @@ class Eventos(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
+    # ── /evento configurar_votos ──
+
+    @evento_group.command(
+        name="configurar_votos",
+        description="Configura cuántos votos puede emitir cada usuario en este evento",
+    )
+    @app_commands.describe(
+        cantidad="Número máximo de votos por usuario (1-10). Default: 1",
+    )
+    async def configurar_votos(
+        self,
+        interaction: discord.Interaction,
+        cantidad: app_commands.Range[int, 1, 10],
+    ):
+        if not _es_admin(interaction):
+            return await interaction.response.send_message(
+                embed=_embed_error("Sin permisos", "No tienes permisos para usar este comando."),
+                ephemeral=True,
+            )
+
+        activo = await database.obtener_evento_activo(self.bot.db)
+        if not activo:
+            return await interaction.response.send_message(
+                embed=_embed_advertencia(
+                    "Sin evento activo",
+                    "No hay ningún evento activo. Crea uno con `/evento crear`."
+                ),
+                ephemeral=True,
+            )
+
+        anterior = activo.get("votos_max_por_usuario", 1) or 1
+        await database.configurar_votos_max(self.bot.db, activo["id"], cantidad)
+
+        if cantidad == 1:
+            descripcion_votos = "Cada usuario podrá emitir **1 solo voto** (comportamiento normal)."
+        else:
+            descripcion_votos = f"Cada usuario podrá emitir hasta **{cantidad} votos** por historias diferentes."
+
+        embed = discord.Embed(
+            title="🗳️  Votos Configurados",
+            description=(
+                f"{config.SEPARADOR}\n\n"
+                f"📖  **{activo['nombre']}**  •  ID: `{activo['id']}`\n\n"
+                f"{descripcion_votos}\n\n"
+                f"{config.SEPARADOR}"
+            ),
+            color=config.COLOR_INFO,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="🔄  Cambio",
+            value=f"```{anterior} voto(s) → {cantidad} voto(s)```",
+            inline=True,
+        )
+        embed.add_field(
+            name="📊  Estado del evento",
+            value=f"```{activo['estado']}```",
+            inline=True,
+        )
+        if activo["estado"] == "votando":
+            embed.add_field(
+                name="⚠️  Nota",
+                value="El evento ya está en fase de votación. Los usuarios que aún no hayan usado todos sus votos podrán votar más veces.",
+                inline=False,
+            )
+        embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
+        embed.set_footer(text="COMARCALIT  •  Retos Literarios")
+
+        await interaction.response.send_message(embed=embed)
+
     # ── /evento iniciar_narracion ──
 
     @evento_group.command(
@@ -480,7 +550,14 @@ class Eventos(commands.Cog):
         # Cambiar estado
         await database.cambiar_estado_evento(self.bot.db, activo["id"], "votando")
 
+        # Obtener límite de votos configurado
+        votos_max = activo.get("votos_max_por_usuario", 1) or 1
+
         # Construir embed PÚBLICO (sin detalles de antifraude)
+        votos_info = ""
+        if votos_max > 1:
+            votos_info = f"\n\n🗳️  En este evento puedes emitir hasta **{votos_max} votos** por historias diferentes."
+
         embed = discord.Embed(
             title="🗳️  ¡Votación Abierta!",
             description=(
@@ -488,7 +565,7 @@ class Eventos(commands.Cog):
                 f"📖  **{activo['nombre']}**\n\n"
                 f"{ribby.frase(ribby.VOTACION)}\n\n"
                 f"La votación para este reto ya está disponible.\n"
-                f"Usa `/votar` para emitir tu voto de forma anónima.\n\n"
+                f"Usa `/votar` para emitir tu voto de forma anónima.{votos_info}\n\n"
                 f"{config.SEPARADOR}"
             ),
             color=config.COLOR_VOTACION,
@@ -499,6 +576,12 @@ class Eventos(commands.Cog):
             value=f"```{total_sesiones} sesión(es)  •  {duracion_total:.1f} min totales```",
             inline=False,
         )
+        if votos_max > 1:
+            embed.add_field(
+                name="🗳️  Votos permitidos",
+                value=f"```{votos_max} votos por persona```",
+                inline=False,
+            )
         embed.add_field(
             name="📌  ¿Cómo votar?",
             value="Usa el comando `/votar` para emitir tu voto de forma anónima.",
@@ -531,6 +614,11 @@ class Eventos(commands.Cog):
         admin_embed.add_field(
             name="📥  Umbral de Lectura",
             value=f"```{umbral_lectura} doc{'s' if umbral_lectura != 1 else ''} (50%)```",
+            inline=True,
+        )
+        admin_embed.add_field(
+            name="🗳️  Votos por persona",
+            value=f"```{votos_max} voto(s)```",
             inline=True,
         )
         admin_embed.add_field(

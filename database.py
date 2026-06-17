@@ -47,12 +47,12 @@ def _now_iso() -> str:
 
 # ─────────────────────────── Eventos ───────────────────────────
 
-async def crear_evento(pool: asyncpg.Pool, nombre: str) -> int:
+async def crear_evento(pool: asyncpg.Pool, nombre: str, votos_max: int = 1) -> int:
     """Crea un evento y retorna su ID."""
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO eventos (nombre, fecha_creacion) VALUES ($1, $2) RETURNING id",
-            nombre, _now_iso()
+            "INSERT INTO eventos (nombre, fecha_creacion, votos_max_por_usuario) VALUES ($1, $2, $3) RETURNING id",
+            nombre, _now_iso(), votos_max
         )
 
 
@@ -279,17 +279,62 @@ async def contar_veladas_realizadas(pool: asyncpg.Pool) -> int:
 
 # ─────────────────────────── Votación ───────────────────────────
 
+async def configurar_votos_max(pool: asyncpg.Pool, evento_id: int, max_votos: int) -> None:
+    """Configura el número máximo de votos por usuario para un evento."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE eventos SET votos_max_por_usuario = $1 WHERE id = $2",
+            max_votos, evento_id
+        )
+
+
+async def obtener_votos_max(pool: asyncpg.Pool, evento_id: int) -> int:
+    """Retorna el límite de votos por usuario del evento (default 1)."""
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
+            evento_id
+        )
+        return val if val else 1
+
+
+async def contar_votos_usuario(pool: asyncpg.Pool, evento_id: int, votante_discord_id) -> int:
+    """Cuenta cuántos votos ha emitido un usuario en un evento."""
+    votante_str = str(votante_discord_id)
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, votante_str
+        )
+        return val or 0
+
+
 async def registrar_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id, participante_id: int, es_valido: bool = True) -> bool:
+    """Registra un voto. Verifica que no exceda el límite y que no vote 2 veces por la misma historia."""
     votante_str = str(votante_discord_id)
     es_valido_int = 1 if es_valido else 0
     async with pool.acquire() as conn:
-        # Check if already voted
-        existing = await conn.fetchrow(
-            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, votante_str
+        # Verificar si ya votó por esta misma historia
+        ya_voto_historia = await conn.fetchrow(
+            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND participante_id = $3",
+            evento_id, votante_str, participante_id
         )
-        if existing:
-            return False  # Already voted
+        if ya_voto_historia:
+            return False  # Ya votó por esta historia
+
+        # Verificar límite de votos
+        votos_max = await conn.fetchval(
+            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
+            evento_id
+        ) or 1
+        votos_actuales = await conn.fetchval(
+            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, votante_str
+        ) or 0
+
+        if votos_actuales >= votos_max:
+            return False  # Ya usó todos sus votos
+
         await conn.execute(
             "INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto, es_valido) VALUES ($1, $2, $3, $4, $5)",
             evento_id, votante_str, participante_id, _now_iso(), es_valido_int
@@ -298,16 +343,29 @@ async def registrar_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id,
 
 
 async def obtener_voto_usuario(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> Optional[int]:
+    """Retorna el primer participante_id por el que votó (compatibilidad)."""
     votante_str = str(votante_discord_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND es_valido = 1",
+            "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND es_valido = 1 LIMIT 1",
             evento_id, votante_str
         )
         return row["participante_id"] if row else None
 
 
+async def obtener_votos_usuario_lista(pool: asyncpg.Pool, evento_id: int, votante_discord_id) -> list[int]:
+    """Retorna la lista de participante_ids por los que ya votó el usuario."""
+    votante_str = str(votante_discord_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+            evento_id, votante_str
+        )
+        return [r["participante_id"] for r in rows]
+
+
 async def anular_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> bool:
+    """Anula TODOS los votos de un usuario en un evento."""
     votante_str = str(votante_discord_id)
     async with pool.acquire() as conn:
         res = await conn.execute(
@@ -551,12 +609,17 @@ async def guardar_habilitados(pool, evento_id, habilitados_dict):
 
 
 async def ya_voto(pool, evento_id, discord_id) -> bool:
+    """Retorna True si el usuario ya usó TODOS sus votos disponibles."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+        votos_max = await conn.fetchval(
+            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
+            evento_id
+        ) or 1
+        votos_usados = await conn.fetchval(
+            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
             evento_id, str(discord_id)
-        )
-        return row is not None
+        ) or 0
+        return votos_usados >= votos_max
 
 
 async def esta_habilitado(pool, evento_id, discord_id) -> bool:
