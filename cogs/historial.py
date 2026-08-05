@@ -130,6 +130,53 @@ def _embed_participante(p: dict, idx: int, total: int, evento_nombre: str) -> di
     return embed
 
 
+def _particionar_lineas_embed(lineas: list[str], limite: int = 1024) -> list[str]:
+    """Agrupa líneas para que cada bloque pueda ir en un campo de embed."""
+    bloques: list[str] = []
+    bloque_actual: list[str] = []
+    longitud_actual = 0
+
+    for linea in lineas:
+        separador = 1 if bloque_actual else 0
+        longitud_linea = len(linea)
+
+        if bloque_actual and longitud_actual + separador + longitud_linea > limite:
+            bloques.append("\n".join(bloque_actual))
+            bloque_actual = [linea]
+            longitud_actual = longitud_linea
+            continue
+
+        bloque_actual.append(linea)
+        longitud_actual += separador + longitud_linea
+
+    if bloque_actual:
+        bloques.append("\n".join(bloque_actual))
+
+    return bloques or ["N/A"]
+
+
+def _limitar_campos_embed(campos: list[tuple[str, str, bool]], limite: int) -> list[tuple[str, str, bool]]:
+    """Recorta campos para que la suma de sus textos no exceda un presupuesto."""
+    seleccionados: list[tuple[str, str, bool]] = []
+    usado = 0
+
+    for nombre, valor, inline in campos:
+        costo = len(nombre) + len(valor)
+        if usado + costo > limite:
+            restantes = len(campos) - len(seleccionados)
+            if restantes > 0:
+                aviso = f"... y {restantes} bloque{'s' if restantes != 1 else ''} más"
+                nombre_aviso = "📚  Historias"
+                if usado + len(nombre_aviso) + len(aviso) <= limite:
+                    seleccionados.append((nombre_aviso, aviso, False))
+            break
+
+        seleccionados.append((nombre, valor, inline))
+        usado += costo
+
+    return seleccionados
+
+
 # ─────────────────────────── Vista interactiva /reto info ───────────────────────────
 
 class InfoPaginadaView(discord.ui.View):
@@ -315,22 +362,20 @@ class HistorialSelect(discord.ui.Select):
                     linea += "  " + "  •  ".join(links)
                 lineas.append(linea)
 
-            # Dividir en campos si es muy largo
-            texto = "\n".join(lineas)
-            if len(texto) <= 1024:
-                embed.add_field(name="📚  Historias", value=texto, inline=False)
+            bloques = _particionar_lineas_embed(lineas)
+            campos_historia = []
+            if len(bloques) == 1:
+                campos_historia.append(("📚  Historias", bloques[0], False))
             else:
-                mitad = len(lineas) // 2
-                embed.add_field(
-                    name="📚  Historias (1/2)",
-                    value="\n".join(lineas[:mitad]),
-                    inline=False,
-                )
-                embed.add_field(
-                    name="📚  Historias (2/2)",
-                    value="\n".join(lineas[mitad:]),
-                    inline=False,
-                )
+                total_bloques = len(bloques)
+                for i, bloque in enumerate(bloques, 1):
+                    campos_historia.append((f"📚  Historias ({i}/{total_bloques})", bloque, False))
+
+            presupuesto_total = 5400
+            presupuesto_restante = max(0, presupuesto_total - len(embed.title or "") - len(embed.description or ""))
+            campos_historia = _limitar_campos_embed(campos_historia, presupuesto_restante)
+            for nombre, valor, inline in campos_historia:
+                embed.add_field(name=nombre, value=valor, inline=inline)
 
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_footer(text="COMARCALIT  •  Retos Literarios  •  Archivo Histórico")
@@ -391,6 +436,7 @@ class Historial(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = bot.db  # type: ignore[attr-defined]
 
     reto_group = app_commands.Group(
         name="reto",
@@ -402,7 +448,7 @@ class Historial(commands.Cog):
 
     @reto_group.command(name="info", description="Muestra información del evento activo")
     async def info(self, interaction: discord.Interaction):
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             embed = discord.Embed(
                 description="**ℹ️  Sin evento activo**\n\nNo hay ningún evento activo en este momento.",
@@ -411,10 +457,10 @@ class Historial(commands.Cog):
             embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        participantes = await database.obtener_participantes(self.bot.db, activo["id"])
+        participantes = await database.obtener_participantes(self.db, activo["id"])
 
         # Crear vista paginada
-        view = InfoPaginadaView(self.bot.db, activo, participantes)
+        view = InfoPaginadaView(self.db, activo, participantes)
         embed = _embed_resumen_evento(activo, len(participantes))
 
         await interaction.response.send_message(embed=embed, view=view)
@@ -423,7 +469,7 @@ class Historial(commands.Cog):
 
     @reto_group.command(name="historial", description="Muestra los eventos pasados")
     async def historial(self, interaction: discord.Interaction):
-        eventos = await database.obtener_ultimos_eventos(self.bot.db)
+        eventos = await database.obtener_ultimos_eventos(self.db)
 
         if not eventos:
             embed = discord.Embed(
@@ -455,7 +501,7 @@ class Historial(commands.Cog):
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_footer(text="COMARCALIT  •  Retos Literarios  •  Archivo Histórico")
 
-        view = HistorialView(eventos, self.bot.db)
+        view = HistorialView(eventos, self.db)
         await interaction.response.send_message(embed=embed, view=view)
 
 

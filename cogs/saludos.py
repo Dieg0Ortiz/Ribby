@@ -69,6 +69,7 @@ class Saludos(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = bot.db  # type: ignore[attr-defined]
 
         # Cache de IDs de mensajes ya respondidos para evitar duplicados
         self._respondidos: set[int] = set()
@@ -118,7 +119,7 @@ class Saludos(commands.Cog):
         # Cargar desde BD solo una vez por sesión
         if not estado["cargado_db"]:
             try:
-                memoria = await database.obtener_memoria_usuario(self.bot.db, usuario_id)
+                memoria = await database.obtener_memoria_usuario(self.db, usuario_id)
                 if memoria:
                     estado["mood"] = memoria.get("mood", "frio")
                     estado["interacciones"] = memoria.get("interacciones", 0)
@@ -255,7 +256,7 @@ class Saludos(commands.Cog):
                 estado["resumen"] = resumen
 
                 await database.guardar_memoria_usuario(
-                    self.bot.db,
+                    self.db,
                     usuario_id,
                     resumen=resumen,
                     mood=estado["mood"],
@@ -495,7 +496,7 @@ class Saludos(commands.Cog):
         )
 
         # Obtener tamaño de la biblioteca
-        libros = await database.contar_libros_biblioteca(self.bot.db)
+        libros = await database.contar_libros_biblioteca(self.db)
 
         if self.model:
             try:

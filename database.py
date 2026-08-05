@@ -29,6 +29,7 @@ async def init_db() -> asyncpg.Pool:
     try:
         # statement_cache_size=0 es necesario para que funcione con el "Transaction Pooler" de Supabase
         pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
+        await _asegurar_esquema_eventos(pool)
         return pool
     except Exception as e:
         log.error(f"Error conectando a la base de datos: {e}")
@@ -43,6 +44,39 @@ def _now() -> datetime:
 def _now_iso() -> str:
     """Retorna el timestamp UTC actual en formato ISO 8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _asegurar_esquema_eventos(pool: asyncpg.Pool) -> None:
+    """Aplica ajustes mínimos al esquema que el código espera al iniciar."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            ALTER TABLE eventos
+            ADD COLUMN IF NOT EXISTS votos_max_por_usuario INTEGER NOT NULL DEFAULT 1;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE votos
+            DROP CONSTRAINT IF EXISTS votos_evento_votante_key;
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE votos
+            DROP CONSTRAINT IF EXISTS votos_evento_id_votante_discord_id_key;
+            """
+        )
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE votos
+                ADD CONSTRAINT votos_evento_votante_participante_key
+                UNIQUE (evento_id, votante_discord_id, participante_id);
+                """
+            )
+        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError):
+            pass
 
 
 # ─────────────────────────── Eventos ───────────────────────────
@@ -89,7 +123,7 @@ async def configurar_canales_evento(
 async def actualizar_estado_evento(pool: asyncpg.Pool, evento_id: int, estado: str) -> None:
     async with pool.acquire() as conn:
         query = "UPDATE eventos SET estado = $1"
-        args = [estado]
+        args: list[Any] = [estado]
         if estado == "cerrado":
             query += ", fecha_cierre = $2"
             args.append(_now_iso())
@@ -681,10 +715,10 @@ async def guardar_documento(
     usuario_discord_id: str,
     tipo: str,  # 'pdf' | 'portada'
     url_discord: str,
-    url_respaldo: str = None,
-    nombre_archivo: str = None,
-    content_type: str = None,
-    tamanio_bytes: int = None,
+    url_respaldo: Optional[str] = None,
+    nombre_archivo: Optional[str] = None,
+    content_type: Optional[str] = None,
+    tamanio_bytes: Optional[int] = None,
 ) -> str:
     """
     Inserta o actualiza el documento de un participante.
@@ -753,7 +787,7 @@ async def obtener_documento(
 async def obtener_documentos_evento(
     pool: asyncpg.Pool,
     evento_id: int,
-    tipo: str = None,  # None = todos, 'pdf' | 'portada'
+    tipo: Optional[str] = None,  # None = todos, 'pdf' | 'portada'
 ) -> list[Dict[str, Any]]:
     """Retorna todos los documentos de un evento, opcionalmente filtrados por tipo."""
     async with pool.acquire() as conn:

@@ -28,6 +28,38 @@ def _es_admin(interaction: discord.Interaction) -> bool:
     )
 
 
+def _limitar_bloque_embed(lineas: list[str], limite: int = 1024) -> str:
+    """Recorta una lista de líneas para que quepa en un campo de embed."""
+    if not lineas:
+        return ""
+
+    resultado: list[str] = []
+    longitud = 0
+
+    for linea in lineas:
+        separador = 2 if resultado else 0
+        candidato = longitud + separador + len(linea)
+        if candidato > limite:
+            break
+
+        resultado.append(linea)
+        longitud = candidato
+
+    valor = "\n\n".join(resultado)
+    omitidas = len(lineas) - len(resultado)
+
+    if omitidas > 0:
+        sufijo = f"\n\n... y {omitidas} más"
+        if len(valor) + len(sufijo) > limite:
+            valor = valor[: max(0, limite - len(sufijo))]
+        valor += sufijo
+
+    if not valor:
+        return lineas[0][:limite]
+
+    return valor
+
+
 def _embed_error(titulo: str, descripcion: str) -> discord.Embed:
     """Crea un embed de error estilizado."""
     embed = discord.Embed(
@@ -53,6 +85,7 @@ class Eventos(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = bot.db  # type: ignore[attr-defined]
 
     # ── Grupo de comandos /evento ──
 
@@ -74,7 +107,7 @@ class Eventos(commands.Cog):
             )
 
         # Verificar que no haya un evento activo
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia(
@@ -85,7 +118,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        evento_id = await database.crear_evento(self.bot.db, nombre)
+        evento_id = await database.crear_evento(self.db, nombre)
 
         embed = discord.Embed(
             title="✨  Nuevo Evento Literario",
@@ -150,7 +183,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia(
@@ -162,7 +195,7 @@ class Eventos(commands.Cog):
 
         respaldo_id = canal_respaldo.id if canal_respaldo else None
         await database.configurar_canales_evento(
-            self.bot.db, activo["id"], canal_voz.id, canal_envio.id, respaldo_id
+            self.db, activo["id"], canal_voz.id, canal_envio.id, respaldo_id
         )
 
         canales_texto = (
@@ -213,7 +246,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia(
@@ -224,7 +257,7 @@ class Eventos(commands.Cog):
             )
 
         anterior = activo.get("votos_max_por_usuario", 1) or 1
-        await database.configurar_votos_max(self.bot.db, activo["id"], cantidad)
+        await database.configurar_votos_max(self.db, activo["id"], cantidad)
 
         if cantidad == 1:
             descripcion_votos = "Cada usuario podrá emitir **1 solo voto** (comportamiento normal)."
@@ -276,7 +309,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia("Sin evento activo", "No hay ningún evento activo."),
@@ -306,10 +339,10 @@ class Eventos(commands.Cog):
         await interaction.response.defer()
 
         # Crear nueva sesión de narración
-        narracion_id, numero_sesion = await database.crear_narracion(self.bot.db, activo["id"])
+        narracion_id, numero_sesion = await database.crear_narracion(self.db, activo["id"])
 
         # Cambiar estado a narrando
-        await database.cambiar_estado_evento(self.bot.db, activo["id"], "narrando")
+        await database.cambiar_estado_evento(self.db, activo["id"], "narrando")
 
         # Registrar automáticamente a los usuarios que ya están en el canal de voz
         registrados_previos = 0
@@ -323,7 +356,7 @@ class Eventos(commands.Cog):
                 and member.voice.channel.id == canal_voz_id
             ):
                 await database.registrar_entrada_voz(
-                    self.bot.db, activo["id"], str(member.id), narracion_id
+                    self.db, activo["id"], str(member.id), narracion_id
                 )
                 registrados_previos += 1
 
@@ -380,7 +413,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia("Sin evento activo", "No hay ningún evento activo."),
@@ -399,10 +432,10 @@ class Eventos(commands.Cog):
         await interaction.response.defer()
 
         # Cerrar sesiones de voz abiertas
-        await database.cerrar_sesiones_abiertas(self.bot.db, activo["id"])
+        await database.cerrar_sesiones_abiertas(self.db, activo["id"])
 
         # Cerrar la narración activa
-        resultado = await database.cerrar_narracion_activa(self.bot.db, activo["id"])
+        resultado = await database.cerrar_narracion_activa(self.db, activo["id"])
         if not resultado:
             return await interaction.followup.send(
                 embed=_embed_advertencia("Error", "No se encontró una narración activa."),
@@ -411,15 +444,15 @@ class Eventos(commands.Cog):
         narr_id, duracion_min, numero_sesion = resultado
 
         # Calcular asistencia de esta sesión
-        asistencia = await database.calcular_asistencia_total(self.bot.db, activo["id"])
+        asistencia = await database.calcular_asistencia_total(self.db, activo["id"])
 
         # Obtener historial de todas las narraciones
-        narraciones = await database.obtener_narraciones(self.bot.db, activo["id"])
+        narraciones = await database.obtener_narraciones(self.db, activo["id"])
         duracion_total = sum(n["duracion_minutos"] for n in narraciones)
         total_sesiones = len(narraciones)
 
         # Cambiar estado de vuelta a abierto
-        await database.cambiar_estado_evento(self.bot.db, activo["id"], "abierto")
+        await database.cambiar_estado_evento(self.db, activo["id"], "abierto")
 
         embed = discord.Embed(
             title=f"⏹️  Narración #{numero_sesion} Cerrada",
@@ -474,7 +507,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia("Sin evento activo", "No hay ningún evento activo."),
@@ -492,8 +525,8 @@ class Eventos(commands.Cog):
             )
 
         # Verificar que haya al menos una narración cerrada
-        narraciones = await database.obtener_narraciones(self.bot.db, activo["id"])
-        narracion_activa = await database.obtener_narracion_activa(self.bot.db, activo["id"])
+        narraciones = await database.obtener_narraciones(self.db, activo["id"])
+        narracion_activa = await database.obtener_narracion_activa(self.db, activo["id"])
 
         if not narraciones and not narracion_activa:
             return await interaction.response.send_message(
@@ -509,25 +542,25 @@ class Eventos(commands.Cog):
 
         # Si hay una narración activa, cerrarla automáticamente
         if activo["estado"] == "narrando" and narracion_activa:
-            await database.cerrar_sesiones_abiertas(self.bot.db, activo["id"])
-            await database.cerrar_narracion_activa(self.bot.db, activo["id"])
+            await database.cerrar_sesiones_abiertas(self.db, activo["id"])
+            await database.cerrar_narracion_activa(self.db, activo["id"])
 
         # Calcular duración total de TODAS las narraciones
-        narraciones = await database.obtener_narraciones(self.bot.db, activo["id"])
+        narraciones = await database.obtener_narraciones(self.db, activo["id"])
         duracion_total = sum(n["duracion_minutos"] for n in narraciones)
         total_sesiones = len(narraciones)
 
         # Guardar duración total en el evento
-        await database.guardar_duracion_total_narraciones(self.bot.db, activo["id"])
+        await database.guardar_duracion_total_narraciones(self.db, activo["id"])
 
         # ── Condición 1: Asistencia de Voz ──
-        asistencia = await database.calcular_asistencia_total(self.bot.db, activo["id"])
+        asistencia = await database.calcular_asistencia_total(self.db, activo["id"])
         umbral_voz = duracion_total * config.PORCENTAJE_ASISTENCIA_MINIMO
 
         # ── Condición 2: Descargas de Documentos ──
-        total_documentos = await database.contar_documentos_subidos(self.bot.db, activo["id"])
+        total_documentos = await database.contar_documentos_subidos(self.db, activo["id"])
         umbral_lectura = math.ceil(total_documentos * 0.5)
-        descargas_usuarios = await database.calcular_descargas_por_usuario(self.bot.db, activo["id"])
+        descargas_usuarios = await database.calcular_descargas_por_usuario(self.db, activo["id"])
 
         # ── Combinar habilitados ──
         habilitados_dict = {}
@@ -545,10 +578,10 @@ class Eventos(commands.Cog):
                     if uid not in habilitados_dict:
                         habilitados_dict[uid] = {"minutos": asistencia.get(uid, 0), "descargas": descargas}
 
-        await database.guardar_habilitados(self.bot.db, activo["id"], habilitados_dict)
+        await database.guardar_habilitados(self.db, activo["id"], habilitados_dict)
 
         # Cambiar estado
-        await database.cambiar_estado_evento(self.bot.db, activo["id"], "votando")
+        await database.cambiar_estado_evento(self.db, activo["id"], "votando")
 
         # Obtener límite de votos configurado
         votos_max = activo.get("votos_max_por_usuario", 1) or 1
@@ -663,7 +696,7 @@ class Eventos(commands.Cog):
                 ephemeral=True,
             )
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             return await interaction.response.send_message(
                 embed=_embed_advertencia("Sin evento activo", "No hay ningún evento activo para cerrar."),
@@ -674,16 +707,16 @@ class Eventos(commands.Cog):
 
         # Si estaba en narración, cerrar sesiones abiertas
         if activo["estado"] == "narrando":
-            await database.cerrar_sesiones_abiertas(self.bot.db, activo["id"])
+            await database.cerrar_sesiones_abiertas(self.db, activo["id"])
 
         # Obtener resultados de votación
-        resultados = await database.obtener_resultados_votacion(self.bot.db, activo["id"])
+        resultados = await database.obtener_resultados_votacion(self.db, activo["id"])
 
         # Cambiar estado
-        await database.cambiar_estado_evento(self.bot.db, activo["id"], "cerrado")
+        await database.cambiar_estado_evento(self.db, activo["id"], "cerrado")
 
         # Contar libros en la biblioteca
-        libros = await database.contar_libros_biblioteca(self.bot.db)
+        libros = await database.contar_libros_biblioteca(self.db)
 
         # Construir embed de resultados
         embed = discord.Embed(
@@ -710,7 +743,7 @@ class Eventos(commands.Cog):
 
             embed.add_field(
                 name="📊  Resultados",
-                value="\n\n".join(tabla_lineas),
+                value=_limitar_bloque_embed(tabla_lineas),
                 inline=False,
             )
 
@@ -739,8 +772,8 @@ class Eventos(commands.Cog):
         await interaction.followup.send(embed=embed)
 
         # ── Reporte privado de votos nulos para admin ──
-        conteo = await database.contar_votos_totales(self.bot.db, activo["id"])
-        votos_nulos = await database.obtener_votos_nulos(self.bot.db, activo["id"])
+        conteo = await database.contar_votos_totales(self.db, activo["id"])
+        votos_nulos = await database.obtener_votos_nulos(self.db, activo["id"])
 
         admin_embed = discord.Embed(
             title="🔒  Reporte de Votos (Solo Admin)",
@@ -781,7 +814,7 @@ class Eventos(commands.Cog):
                 )
             admin_embed.add_field(
                 name="🚫  Votos Anulados",
-                value="\n\n".join(nulos_lineas[:10]),  # Limitar a 10 para no exceder
+                value=_limitar_bloque_embed(nulos_lineas[:10]),
                 inline=False,
             )
         else:

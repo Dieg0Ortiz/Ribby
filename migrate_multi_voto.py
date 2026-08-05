@@ -45,6 +45,8 @@ async def migrate():
             """
             ALTER TABLE votos
             DROP CONSTRAINT IF EXISTS votos_evento_votante_key;
+            ALTER TABLE votos
+            DROP CONSTRAINT IF EXISTS votos_evento_id_votante_discord_id_key;
             """,
         ),
         # 3. Agregar constraint para evitar votar 2 veces por la misma historia

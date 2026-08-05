@@ -19,7 +19,9 @@ async def add_constraints():
     queries = [
         "ALTER TABLE narraciones ADD CONSTRAINT narraciones_evento_sesion_key UNIQUE (evento_id, numero_sesion);",
         "ALTER TABLE participantes ADD CONSTRAINT participantes_evento_usuario_key UNIQUE (evento_id, usuario_discord_id);",
-        "ALTER TABLE votos ADD CONSTRAINT votos_evento_votante_key UNIQUE (evento_id, votante_discord_id);"
+        "ALTER TABLE votos DROP CONSTRAINT IF EXISTS votos_evento_votante_key;",
+        "ALTER TABLE votos DROP CONSTRAINT IF EXISTS votos_evento_id_votante_discord_id_key;",
+        "ALTER TABLE votos ADD CONSTRAINT votos_evento_votante_participante_key UNIQUE (evento_id, votante_discord_id, participante_id);"
     ]
     
     for q in queries:

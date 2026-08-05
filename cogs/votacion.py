@@ -139,11 +139,12 @@ class Votacion(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = bot.db  # type: ignore[attr-defined]
 
     @app_commands.command(name="votar", description="Vota por tu historia favorita del evento activo")
     @app_commands.guilds(*config.GUILD_IDS) if config.GUILD_IDS else lambda f: f
     async def votar(self, interaction: discord.Interaction):
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
 
         # Verificación 1 — Estado del evento
         if not activo or activo["estado"] != "votando":
@@ -158,7 +159,7 @@ class Votacion(commands.Cog):
 
         # Obtener límite de votos y votos usados
         votos_max = activo.get("votos_max_por_usuario", 1) or 1
-        votos_usados = await database.contar_votos_usuario(self.bot.db, evento_id, user_id)
+        votos_usados = await database.contar_votos_usuario(self.db, evento_id, user_id)
 
         # Verificación 2 — ¿Ya usó todos sus votos?
         if votos_usados >= votos_max:
@@ -182,15 +183,15 @@ class Votacion(commands.Cog):
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         # Verificación silenciosa — ¿Está habilitado?
-        es_valido = await database.esta_habilitado(self.bot.db, evento_id, user_id)
+        es_valido = await database.esta_habilitado(self.db, evento_id, user_id)
 
         # Obtener participantes (excluyendo al votante)
-        participantes = await database.obtener_participantes(self.bot.db, evento_id)
+        participantes = await database.obtener_participantes(self.db, evento_id)
         participantes = [p for p in participantes if p["usuario_discord_id"] != user_id]
 
         # Si es multi-voto, excluir historias por las que ya votó
         if votos_usados > 0:
-            ya_votados = await database.obtener_votos_usuario_lista(self.bot.db, evento_id, user_id)
+            ya_votados = await database.obtener_votos_usuario_lista(self.db, evento_id, user_id)
             participantes = [p for p in participantes if p["id"] not in ya_votados]
 
         if not participantes:
@@ -251,7 +252,7 @@ class Votacion(commands.Cog):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text="COMARCALIT  •  Retos Literarios  •  Elige sabiamente")
 
-        view = VotoView(evento_id, participantes, self.bot.db, es_valido, votos_usados, votos_max)
+        view = VotoView(evento_id, participantes, self.db, es_valido, votos_usados, votos_max)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 

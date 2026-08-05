@@ -26,6 +26,8 @@ log = logging.getLogger("bot-literario.participantes")
 
 def _es_admin(interaction: discord.Interaction) -> bool:
     """Verifica si el usuario tiene el rol de administrador literario."""
+    if not isinstance(interaction.user, discord.Member):
+        return False
     return any(
         role.name == config.ADMIN_ROLE_NAME for role in interaction.user.roles
     )
@@ -46,6 +48,7 @@ class Participantes(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = bot.db  # type: ignore[attr-defined]
 
     # ── /participante_registrar ──
 
@@ -81,7 +84,7 @@ class Participantes(commands.Cog):
             # El usuario se registra a sí mismo → cualquiera puede
             objetivo = interaction.user
 
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             embed = discord.Embed(
                 description="**⚠️  Sin evento activo**\n\nNo hay ningún evento activo en este momento.",
@@ -100,9 +103,9 @@ class Participantes(commands.Cog):
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
         pid = await database.registrar_participante(
-            self.bot.db,
+            self.db,
             activo["id"],
-            str(objetivo.id),
+            objetivo.id,
             objetivo.display_name,
             titulo,
         )
@@ -148,13 +151,14 @@ class Participantes(commands.Cog):
         if not message.attachments:
             return
 
+        channel_name = getattr(message.channel, 'name', 'DM')
         log.info(
             f"📨 Mensaje con {len(message.attachments)} adjunto(s) de {message.author.display_name} "
-            f"en canal {message.channel.name} (ID: {message.channel.id})"
+            f"en canal {channel_name} (ID: {message.channel.id})"
         )
 
         # Verificar si hay un evento activo con canal de envío configurado
-        activo = await database.obtener_evento_activo(self.bot.db)
+        activo = await database.obtener_evento_activo(self.db)
         if not activo:
             log.info("   ↳ Ignorado: no hay evento activo")
             return
@@ -177,7 +181,7 @@ class Participantes(commands.Cog):
 
         # Buscar al participante — DEBE estar registrado previamente
         participante = await database.obtener_participante_por_usuario(
-            self.bot.db, activo["id"], str(message.author.id)
+            self.db, activo["id"], str(message.author.id)
         )
 
         if not participante:
@@ -225,7 +229,7 @@ class Participantes(commands.Cog):
             url_respaldo = None
             if activo["canal_respaldo_id"]:
                 canal_respaldo = self.bot.get_channel(activo["canal_respaldo_id"])
-                if canal_respaldo:
+                if canal_respaldo and isinstance(canal_respaldo, discord.TextChannel):
                     try:
                         file = await attachment.to_file()
                         prefijo = "📄 Documento" if es_documento else "🖼️ Portada"
@@ -244,7 +248,7 @@ class Participantes(commands.Cog):
             # --- Persistir en documentos_participantes y sincronizar con participantes ---
             try:
                 url_activa = await database.guardar_documento(
-                    pool               = self.bot.db,
+                    pool               = self.db,
                     participante_id    = participante["id"],
                     evento_id          = activo["id"],
                     usuario_discord_id = str(message.author.id),
@@ -264,16 +268,16 @@ class Participantes(commands.Cog):
                 log.error(f"   ❌ Error persistiendo en documentos_participantes: {e}")
                 url_activa = url_respaldo or url_discord
                 if tipo == "pdf":
-                    await database.actualizar_pdf(self.bot.db, participante["id"], url_activa)
+                    await database.actualizar_pdf(self.db, participante["id"], url_activa)
                 else:
-                    await database.actualizar_portada(self.bot.db, participante["id"], url_activa)
+                    await database.actualizar_portada(self.db, participante["id"], url_activa)
 
             archivos_procesados.append((emoji_tipo, etiqueta, attachment.filename))
 
         # Confirmar al usuario con un embed bonito
         if archivos_procesados:
             # Contar libros en la biblioteca
-            libros = await database.contar_libros_biblioteca(self.bot.db)
+            libros = await database.contar_libros_biblioteca(self.db)
 
             # Elegir frase según tipo de archivo
             tiene_doc     = any(t == "Documento" for _, t, _ in archivos_procesados)
