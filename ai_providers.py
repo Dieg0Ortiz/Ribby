@@ -40,10 +40,18 @@ def unir_system(system_prompt: SystemPrompt) -> str:
     return "\n\n".join(p for p in system_prompt if p)
 
 
+# Precios aproximados (USD por millón de tokens) de Claude Haiku 5.5, el modelo por defecto. Solo sirven para
+# la estimación de /prueba estado; si cambias CLAUDE_MODEL, los números son orientativos.
+PRECIO_ENTRADA, PRECIO_SALIDA = 0.10, 0.50
+PRECIO_CACHE_LECTURA, PRECIO_CACHE_ESCRITURA = 0.01, 0.125
+
+
 class AIProvider:
     """Clase base para todos los proveedores de IA."""
 
     nombre = "AIProvider"
+    # Tokens de la última llamada: {"entrada", "salida", "cache_lectura", "cache_escritura"}
+    ultimo_uso: dict = {}
 
     async def generate(
         self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
@@ -121,6 +129,12 @@ class ClaudeProvider(AIProvider):
 
         uso = getattr(resp, "usage", None)
         if uso is not None:
+            self.ultimo_uso = {
+                "entrada": getattr(uso, "input_tokens", 0) or 0,
+                "salida": getattr(uso, "output_tokens", 0) or 0,
+                "cache_lectura": getattr(uso, "cache_read_input_tokens", 0) or 0,
+                "cache_escritura": getattr(uso, "cache_creation_input_tokens", 0) or 0,
+            }
             log.debug(
                 f"Claude: {uso.input_tokens} tokens de entrada, "
                 f"{getattr(uso, 'cache_read_input_tokens', 0) or 0} leídos de caché, "
@@ -175,6 +189,10 @@ class GeminiProvider(AIProvider):
                 texto = (resp.text or "").strip()
                 if not texto:
                     raise RuntimeError("Respuesta vacía de Gemini")
+                meta = getattr(resp, "usage_metadata", None)
+                self.ultimo_uso = {"entrada": getattr(meta, "prompt_token_count", 0) or 0,
+                                   "salida": getattr(meta, "candidates_token_count", 0) or 0,
+                                   "cache_lectura": 0, "cache_escritura": 0}
                 self.current_key_idx = idx  # Recordar la última llave que funcionó
                 return texto
             except Exception as e:  # noqa: BLE001
@@ -223,6 +241,9 @@ class OpenAICompatibleProvider(AIProvider):
                     raise RuntimeError(f"{self.nombre} error {resp.status}: {texto[:300]}")
                 data = await resp.json()
 
+        uso = data.get("usage") or {}
+        self.ultimo_uso = {"entrada": uso.get("prompt_tokens", 0) or 0, "salida": uso.get("completion_tokens", 0) or 0,
+                           "cache_lectura": 0, "cache_escritura": 0}
         contenido = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         # Algunos modelos abiertos incluyen su razonamiento entre <think>...</think>: no se muestra
         contenido = re.sub(r"<think>.*?</think>", "", contenido, flags=re.S | re.I)
@@ -261,10 +282,40 @@ class ProviderManager:
             ))
 
         self.ultimo_proveedor = ""
+        self.ultimo_uso: dict = {}
+        # Tokens gastados desde que arrancó el bot: {proveedor: {llamadas, entrada, salida, cache_lectura, cache_escritura}}
+        self.uso: dict[str, dict[str, int]] = {}
         log.info(
             f"ProviderManager inicializado con {len(self.providers)} proveedor(es) de IA: "
             + (" → ".join(p.nombre for p in self.providers) or "ninguno")
         )
+
+    def _acumular(self, proveedor: str, uso: dict) -> None:
+        if not hasattr(self, "uso"):
+            self.uso = {}
+        total = self.uso.setdefault(
+            proveedor, {"llamadas": 0, "entrada": 0, "salida": 0, "cache_lectura": 0, "cache_escritura": 0}
+        )
+        total["llamadas"] += 1
+        for clave in ("entrada", "salida", "cache_lectura", "cache_escritura"):
+            total[clave] += int(uso.get(clave, 0) or 0)
+
+    def resumen_uso(self) -> str:
+        """Tokens gastados desde el arranque, por proveedor, con una estimación del coste de Claude."""
+        if not getattr(self, "uso", None):
+            return "Sin llamadas a la IA desde el arranque."
+        lineas = []
+        for nombre, t in self.uso.items():
+            linea = (f"**{nombre}**: {t['llamadas']} llamadas · {t['entrada']:,} tokens de entrada "
+                     f"({t['cache_lectura']:,} leídos de caché) · {t['salida']:,} de salida")
+            if nombre == "Claude":
+                coste = (t["entrada"] * PRECIO_ENTRADA + t["salida"] * PRECIO_SALIDA
+                         + t["cache_lectura"] * PRECIO_CACHE_LECTURA + t["cache_escritura"] * PRECIO_CACHE_ESCRITURA) / 1e6
+                entrada_total = t["entrada"] + t["cache_lectura"] + t["cache_escritura"]
+                aciertos = t["cache_lectura"] / entrada_total * 100 if entrada_total else 0
+                linea += f" · ≈ ${coste:.3f} (caché: {aciertos:.0f} % de la entrada)"
+            lineas.append(linea)
+        return "\n".join(lineas)
 
     async def generate(
         self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
@@ -276,8 +327,11 @@ class ProviderManager:
         for provider in self.providers:
             try:
                 log.debug(f"Generando respuesta con {provider.nombre}...")
+                provider.ultimo_uso = {}
                 texto = await provider.generate(system_prompt, chat_history, max_tokens)
                 self.ultimo_proveedor = provider.nombre  # Para los logs de tiempos (¿respondió Claude o un respaldo?)
+                self.ultimo_uso = dict(provider.ultimo_uso)
+                self._acumular(provider.nombre, self.ultimo_uso)
                 return texto
             except Exception as e:  # noqa: BLE001
                 ultimo_error = e

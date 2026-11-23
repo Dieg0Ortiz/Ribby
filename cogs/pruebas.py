@@ -200,6 +200,21 @@ class Pruebas(commands.Cog):
                     f"\n⚠️ **Hay {len(otras)} copia(s) más conectadas:** " + ", ".join(f"`{o}`" for o in otras)
                     + "\nApágalas: si no, pueden salir respuestas duplicadas (una de ellas con frases predeterminadas)."
                 )
+        if _puede_probar(interaction):
+            # Diagnóstico: quién es la pareja de Ribby en cada base de datos (los datos de cada una son independientes)
+            try:
+                with comun.contexto_real():
+                    pareja_real = await database.pareja_actual(self.db)
+                with comun.contexto_pruebas():
+                    pareja_pruebas = await database.pareja_actual(self.db)
+                nombre = lambda p: md(p["nombre_display"]) if p else "nadie"  # noqa: E731
+                texto += (f"\n💞 Pareja de Ribby · **datos reales:** {nombre(pareja_real)} · "
+                          f"**datos de pruebas:** {nombre(pareja_pruebas)}")
+            except Exception as e:  # noqa: BLE001
+                log.info(f"No se pudo consultar la pareja para el estado: {e}")
+            modelo = getattr(saludos, "model", None)
+            if modelo is not None and hasattr(modelo, "resumen_uso"):
+                texto += "\n\n💸 **Uso de la IA desde el arranque** (aprox.):\n" + modelo.resumen_uso()
         forzado = comun.eventos_forzados.get(interaction.user.id)
         if forzado and comun.en_prueba():
             texto += f"\n🎉 Evento forzado para ti: **{forzado}**"

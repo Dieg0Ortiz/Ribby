@@ -34,6 +34,7 @@ log = logging.getLogger("bot-literario.comun")
 _usuario_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_usuario", default=None)
 _servidor_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_servidor", default=None)
 _forzar_real: contextvars.ContextVar[bool] = contextvars.ContextVar("ribby_forzar_real", default=False)
+_forzar_pruebas: contextvars.ContextVar[bool] = contextvars.ContextVar("ribby_forzar_pruebas", default=False)
 _modo_global = False
 eventos_forzados: dict[int, str] = {}  # usuario → id de evento de temporada (solo en pruebas)
 
@@ -72,6 +73,8 @@ def en_prueba(usuario_id: Optional[int] = None) -> bool:
     """
     if _forzar_real.get():
         return False
+    if _forzar_pruebas.get():
+        return True
     return _modo_global or _servidor_actual.get() in config.GUILDS_PRUEBAS
 
 
@@ -83,6 +86,16 @@ def contexto_real():
         yield
     finally:
         _forzar_real.reset(token)
+
+
+@contextlib.contextmanager
+def contexto_pruebas():
+    """Dentro de este bloque las consultas van siempre a la base de datos de pruebas."""
+    token = _forzar_pruebas.set(True)
+    try:
+        yield
+    finally:
+        _forzar_pruebas.reset(token)
 
 
 def instalar_contexto(bot: discord.Client) -> None:

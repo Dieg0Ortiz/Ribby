@@ -669,5 +669,39 @@ class TestParejaEnElContexto(unittest.TestCase):
         self.assertIn("mi amor", texto)
 
 
+class TestMemoriaSeparadaPorModo(unittest.TestCase):
+    def tearDown(self):
+        comun.activar_modo_global(False)
+
+    def test_lo_hablado_en_pruebas_no_pasa_a_la_comarca(self):
+        from collections import OrderedDict
+        import database as bd
+
+        async def sin_memoria(db, uid):
+            return None
+
+        original = bd.obtener_memoria_usuario
+        bd.obtener_memoria_usuario = sin_memoria
+        try:
+            cog = saludos.Saludos.__new__(saludos.Saludos)
+            cog._estado_usuarios = OrderedDict()
+            cog.db = None
+
+            async def prueba():
+                comun.activar_modo_global(True)
+                estado_pruebas = await cog._obtener_estado(5)
+                estado_pruebas["mensajes"].append({"role": "ribby", "content": "Mi pareja es Cursknight", "canal": 10})
+                comun.activar_modo_global(False)
+                estado_real = await cog._obtener_estado(5)
+                return estado_pruebas, estado_real
+
+            estado_pruebas, estado_real = asyncio.run(prueba())
+        finally:
+            bd.obtener_memoria_usuario = original
+        self.assertIsNot(estado_pruebas, estado_real)
+        self.assertEqual(estado_real["mensajes"], [])
+        self.assertEqual(saludos.Saludos._intercambios_otros_canales(estado_real, 20), "")
+
+
 if __name__ == "__main__":
     unittest.main()

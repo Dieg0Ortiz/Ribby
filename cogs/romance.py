@@ -1113,7 +1113,7 @@ class Afinidad(commands.Cog):
         pedido = ct.pedido_inicio(
             usuario.display_name, nivel,
             af.contexto_prompt(estado, ocupada, pareja["nombre_display"] if ocupada and pareja else None),
-            resumen, datos, previas, await database.premisas_recientes(self.db), ingredientes, total, escena_reto,
+            resumen, datos, previas, await database.premisas_recientes(self.db, 15), ingredientes, total, escena_reto,
             ct.gustos_ribby(lr.PREGUNTAS_RIBBY, await database.capitulos_leidos(self.db, usuario.id)),
             _contexto_temporada(), tema, noticias,
         )

@@ -97,7 +97,7 @@ def puntuar(h: dict[str, Any], claves: list[str]) -> float:
     return total
 
 
-def candidatos(catalogo: list[dict[str, Any]], consulta: str, limite: int = 40) -> list[tuple[float, dict]]:
+def candidatos(catalogo: list[dict[str, Any]], consulta: str, limite: int = 25) -> list[tuple[float, dict]]:
     """Historias ordenadas por puntuación local (las de 0 puntos van al final, al azar)."""
     claves = palabras_clave(consulta)
     puntuadas = [(puntuar(h, claves), h) for h in catalogo]
@@ -109,7 +109,7 @@ def candidatos(catalogo: list[dict[str, Any]], consulta: str, limite: int = 40) 
 # ─────────────────────────── IA: prompt y respuesta ───────────────────────────
 
 def linea_catalogo(h: dict[str, Any]) -> str:
-    desc = re.sub(r"\s+", " ", h.get("descripcion") or "")[:260]
+    desc = re.sub(r"\s+", " ", h.get("descripcion") or "")[:170]
     extra = []
     if h.get("madura"):
         extra.append("+18")

@@ -193,7 +193,7 @@ def pedido_inicio(
     previas = "\n".join(
         f"- «{c.get('titulo')}»: {c.get('resumen') or c.get('premisa') or ''}" for c in citas_previas
     ) or "(es su primera cita)"
-    usadas = "\n".join(f"- {p}" for p in premisas_usadas[:40]) or "(ninguna)"
+    usadas = "\n".join(f"- {p}" for p in premisas_usadas[:15]) or "(ninguna)"
     familia = (
         f"{REGLAS_FAMILIA}\nNOTICIAS QUE RIBBY PUEDE CONTARLE A SU PADRE:\n{noticias or '(pocas novedades)'}\n"
         if nivel == "creador" else ""

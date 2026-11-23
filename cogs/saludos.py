@@ -38,7 +38,9 @@ log = logging.getLogger("bot-literario.saludos")
 COLORES_RIBBY = [0xF9A8D4, 0x8B5CF6, 0xEC4899, 0x06B6D4, 0x10B981, 0x6366F1]
 
 # Cada cuántas interacciones se genera un nuevo resumen de memoria
-_FRECUENCIA_RESUMEN = 5
+_FRECUENCIA_RESUMEN = 8              # Cada cuántas charlas se actualiza (con una llamada a la IA) la memoria de alguien
+_MAX_TOKENS_MEMORIA = 900            # El JSON de la memoria necesita más que el límite normal de respuesta
+_MIN_MENSAJES_RESUMEN = 4            # Con menos charla que esto no merece la llamada
 
 # Límites de memoria en RAM
 _MAX_RESPONDIDOS = 200
@@ -54,11 +56,15 @@ _SIN_MENCIONES = discord.AllowedMentions.none()
 _MENSAJES_HISTORIAL_INICIAL = 30
 
 # Cada cuántas respuestas de Ribby en un canal se actualiza su memoria de la comunidad
-_RESPUESTAS_POR_RESUMEN_COMUNIDAD = 10
-_MAX_MEMORIA_COMUNIDAD = 1500
+_RESPUESTAS_POR_RESUMEN_COMUNIDAD = 25
+_MIN_SEGUNDOS_RESUMEN_COMUNIDAD = 30 * 60   # Como mucho una vez cada 30 min por servidor
+_MAX_MEMORIA_COMUNIDAD = 900
+_MAX_TOKENS_COMUNIDAD = 450
 
 # Intercambios con una persona en OTROS canales que Ribby tiene presentes
-_MAX_INTERCAMBIOS_OTROS_CANALES = 6
+_MAX_INTERCAMBIOS_OTROS_CANALES = 4
+_MAX_PERSONAS_CONTEXTO = 4           # Otras personas de las que se describe qué relación tiene Ribby
+_MAX_MENSAJES_IA = 20                # Mensajes del canal que se envían a la IA (la memoria guarda más)
 
 # FunnyJMystery, líder y fundador de La Comarca
 _ID_LIDER = 666664701228220424
@@ -85,8 +91,8 @@ _RE_TEMA_LIBROS = re.compile(
 # Valor inicial de los enfriamientos: monotonic() cuenta desde el arranque del sistema, así que
 # 0.0 parecería "hace poco" en una máquina o contenedor recién encendido
 _NUNCA = float("-inf")
-_COOLDOWN_ESPONTANEA = 20 * 60       # Como mucho una intervención espontánea cada 20 min por canal
-_PROB_ESPONTANEA = 0.15
+_COOLDOWN_ESPONTANEA = 30 * 60       # Como mucho una intervención espontánea cada 30 min por canal
+_PROB_ESPONTANEA = 0.10
 
 _INSTRUCCION_MOTIVO = {
     "nombre": (
@@ -107,6 +113,17 @@ _INSTRUCCION_MOTIVO = {
 INSTANCIA = f"{socket.gethostname()}:{os.getpid()}"
 _REINTENTOS_IA = 2                # Antes de recurrir a una respuesta predeterminada
 _ESPERA_REINTENTO_IA = 2.0
+
+
+# La memoria de la comunidad solo se envía si se habla de ella o hay más gente en la charla
+_RE_TEMA_COMUNIDAD = re.compile(
+    r"\b(comarca|servidor|reto|retos|evento|pas[oó]|novedad(es)?|noticias?|todos|todas|gente|alguien|"
+    r"qu[eé] (hay|tal|cuentas|me perd[ií])|ayer|hoy)\b", re.I,
+)
+
+
+async def _vacio() -> str:
+    return ""
 
 
 def _hoy() -> date:
@@ -163,6 +180,7 @@ class Saludos(commands.Cog):
         # Estado en memoria por usuario (se carga desde BD en la primera interacción).
         # Estructura por usuario_id:
         # {
+        # Clave: (en_prueba, usuario_id). Valor:
         #   "mensajes": [{"role": "user"|"ribby", "content": str}, ...],
         #   "mood": "frio" | "tsundere" | "calido",
         #   "interacciones": int,   # total acumulado (incluye sesiones anteriores)
@@ -182,6 +200,7 @@ class Saludos(commands.Cog):
         self.memoria = conv.MemoriaCanales()
         self._canales_sembrados: set[int] = set()
         self._respuestas_desde_resumen: dict[int, int] = {}
+        self._ultimo_resumen_comunidad: dict[int, float] = {}
 
         # (servidor, usuario_a, usuario_b) → respuestas/menciones aún sin guardar
         self._relaciones_pendientes: Counter = Counter()
@@ -205,13 +224,16 @@ class Saludos(commands.Cog):
         Retorna el estado del usuario. Si es la primera vez en esta sesión,
         carga mood, interacciones y resumen desde la base de datos.
         """
-        if usuario_id in self._estado_usuarios:
-            self._estado_usuarios.move_to_end(usuario_id)
+        # Lo que Ribby recuerda de alguien vive en una base de datos distinta según el modo (real / pruebas):
+        # en RAM se guarda por separado, o la charla del servidor de pruebas se colaba en La Comarca.
+        clave = (comun.en_prueba(), usuario_id)
+        if clave in self._estado_usuarios:
+            self._estado_usuarios.move_to_end(clave)
         else:
             # Evitar que la memoria crezca sin límite: se descarta el usuario menos reciente
             while len(self._estado_usuarios) >= _MAX_USUARIOS_EN_MEMORIA:
                 self._estado_usuarios.popitem(last=False)
-            self._estado_usuarios[usuario_id] = {
+            self._estado_usuarios[clave] = {
                 "mensajes": [],
                 "mood": "frio",
                 "interacciones": 0,
@@ -221,7 +243,7 @@ class Saludos(commands.Cog):
                 "cargado_db": False,
             }
 
-        estado = self._estado_usuarios[usuario_id]
+        estado = self._estado_usuarios[clave]
 
         # Cargar desde BD solo una vez por sesión
         if not estado["cargado_db"]:
@@ -333,7 +355,7 @@ class Saludos(commands.Cog):
         mensaje (es barato) y, cada _FRECUENCIA_RESUMEN interacciones, pide a la IA
         la memoria actualizada: resumen + datos concretos + pendientes con fecha.
         """
-        if estado["interacciones"] % _FRECUENCIA_RESUMEN == 0 and estado["mensajes"]:
+        if estado["interacciones"] % _FRECUENCIA_RESUMEN == 0 and len(estado["mensajes"]) >= _MIN_MENSAJES_RESUMEN:
             try:
                 hoy = _hoy()
                 conversacion = "\n".join(
@@ -344,7 +366,9 @@ class Saludos(commands.Cog):
                     nombre_usuario, estado.get("resumen", ""), estado["hechos"], estado["pendientes"],
                     conversacion, await self._momentos(usuario_id), hoy,
                 )
-                respuesta = await self.model.generate(mem.SYSTEM_EXTRACCION, [{"role": "user", "content": pedido}])  # type: ignore[union-attr]
+                respuesta = await self.model.generate(  # type: ignore[union-attr]
+                    mem.SYSTEM_EXTRACCION, [{"role": "user", "content": pedido}], max_tokens=_MAX_TOKENS_MEMORIA
+                )
                 resultado = mem.parsear_extraccion(respuesta, estado["hechos"], estado["pendientes"], hoy)
                 if resultado is None:
                     log.info(f"La memoria de {usuario_id} no vino en JSON válido; se conserva la anterior")
@@ -744,7 +768,8 @@ class Saludos(commands.Cog):
     async def olvidar_usuario(self, usuario_id: int) -> None:
         """/ribby olvidar: borra la memoria de las charlas (BD, RAM y lo que dijo en los canales)."""
         await database.olvidar_memoria_usuario(self.db, usuario_id)
-        self._estado_usuarios.pop(usuario_id, None)
+        for modo in (False, True):
+            self._estado_usuarios.pop((modo, usuario_id), None)
         self.memoria.olvidar_autor(usuario_id)
         self._relaciones_pendientes = Counter(
             {k: n for k, n in self._relaciones_pendientes.items() if str(usuario_id) not in k[1:]}
@@ -842,8 +867,8 @@ class Saludos(commands.Cog):
             if m.id not in (autor_id, ribby_id) and not m.bot:
                 personas.append((m.id, m.display_name))
         vistos = {autor_id} | {p[0] for p in personas}
-        personas += conv.participantes(entradas, excluir=vistos, limite=5)
-        personas = personas[:6]
+        personas += conv.participantes(entradas, excluir=vistos, limite=_MAX_PERSONAS_CONTEXTO)
+        personas = personas[:_MAX_PERSONAS_CONTEXTO]
 
         async def seguro(coro, defecto):
             try:
@@ -947,13 +972,23 @@ class Saludos(commands.Cog):
         personas, evento, comunidad, fichas_txt, respuesta, libros = await asyncio.gather(
             seguro(self._contexto_personas(message, entradas), ""),
             seguro(self._contexto_evento(), ""),
-            seguro(self._memoria_comunidad(message.guild.id if message.guild else None), ""),
+            seguro(self._memoria_comunidad(message.guild.id if message.guild else None)
+                   if _RE_TEMA_COMUNIDAD.search(texto) or len({e.autor_id for e in entradas[-8:] if not e.es_ribby}) > 1
+                   else _vacio(), ""),
             seguro(fichas(), ""),
             seguro(self._contexto_respuesta(message), ""),
             seguro(database.contar_libros_biblioteca(self.db), 0),
         )
         return {"personas": personas, "evento": evento, "comunidad": comunidad, "fichas": fichas_txt,
                 "respuesta": respuesta, "libros": libros}
+
+    def _texto_tokens(self) -> str:
+        """' · tokens: 612 nuevos + 2.431 de caché → 87 de salida' de la última llamada a la IA."""
+        uso = getattr(self.model, "ultimo_uso", None) or {}
+        if not uso:
+            return ""
+        return (f" · tokens: {uso.get('entrada', 0)} nuevos + {uso.get('cache_lectura', 0)} de caché "
+                f"→ {uso.get('salida', 0)} de salida")
 
     def _escribiendo(self, channel: discord.abc.Messageable) -> None:
         """Muestra una vez "Ribby está escribiendo…" (una sola petición; respeta los enfriamientos por 429)."""
@@ -1031,8 +1066,13 @@ class Saludos(commands.Cog):
             return
         canal_id = message.channel.id
         self._respuestas_desde_resumen[canal_id] = self._respuestas_desde_resumen.get(canal_id, 0) + 1
-        if self._respuestas_desde_resumen[canal_id] >= _RESPUESTAS_POR_RESUMEN_COMUNIDAD:
+        ahora = monotonic()
+        if (
+            self._respuestas_desde_resumen[canal_id] >= _RESPUESTAS_POR_RESUMEN_COMUNIDAD
+            and ahora - self._ultimo_resumen_comunidad.get(message.guild.id, _NUNCA) >= _MIN_SEGUNDOS_RESUMEN_COMUNIDAD
+        ):
             self._respuestas_desde_resumen[canal_id] = 0
+            self._ultimo_resumen_comunidad[message.guild.id] = ahora
             nombre_canal = getattr(message.channel, "name", "canal")
             # create_task copia el contexto actual (servidor marcado) → misma base de datos (real o pruebas)
             asyncio.get_running_loop().create_task(self._resumir_comunidad(message.guild.id, canal_id, nombre_canal))
@@ -1058,7 +1098,9 @@ class Saludos(commands.Cog):
                 f"Lo que Ribby ya recordaba de la comunidad: {previa or '(nada todavía)'}\n\n"
                 f"Conversación reciente en #{nombre_canal}:\n{conv.transcripcion(entradas)}"
             )
-            nueva = await self.model.generate(sistema, [{"role": "user", "content": pedido}])  # type: ignore[union-attr]
+            nueva = await self.model.generate(  # type: ignore[union-attr]
+                sistema, [{"role": "user", "content": pedido}], max_tokens=_MAX_TOKENS_COMUNIDAD
+            )
             if nueva and nueva.strip():
                 await database.config_guardar(self.db, clave, nueva.strip()[:_MAX_MEMORIA_COMUNIDAD])
                 log.info(f"🧠 Memoria de la comunidad actualizada desde #{nombre_canal}")
@@ -1270,7 +1312,9 @@ class Saludos(commands.Cog):
                 actual = conv.entrada_de_mensaje(message, self._ribby_id())
                 if not texto:
                     actual.texto = "(solo te mencionó)"
-                historial = conv.mensajes_para_ia(entradas, actual, contexto_respuesta=ctx["respuesta"])
+                historial = conv.mensajes_para_ia(
+                    entradas[-_MAX_MENSAJES_IA:], actual, contexto_respuesta=ctx["respuesta"]
+                )
 
                 # ── 7. Lo que Ribby sabe ahora mismo ──
                 pendientes_hoy = mem.pendientes_para_hoy(estado["pendientes"], hoy) if motivo != "espontanea" else []
@@ -1279,7 +1323,7 @@ class Saludos(commands.Cog):
                     contexto_secreto,
                     (
                         "COSAS ÍNTIMAS QUE YA LE HAS CONTADO (puedes volver a ellas con naturalidad):\n"
-                        + "\n".join(f"- {c}" for c in confidencias_contadas[-8:])
+                        + "\n".join(f"- {c}" for c in confidencias_contadas[-4:])
                     ) if confidencias_contadas else "",
                     (
                         "AHORA MISMO: aprovecha la charla para abrirte y contarle esto por primera vez, con tu voz, con "
@@ -1366,6 +1410,7 @@ class Saludos(commands.Cog):
                     f"⏱️ Respuesta a {message.author.display_name} en {ahora_fin - t_inicio:.1f} s "
                     f"(análisis {t_analisis - t_inicio:.1f} s · preparación {t_preparado - t_analisis:.1f} s · "
                     f"IA {ahora_fin - t_ia:.1f} s con {getattr(self.model, 'ultimo_proveedor', '?')})"
+                    + self._texto_tokens()
                 )
                 await tras_responder()
 

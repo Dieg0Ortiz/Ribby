@@ -74,7 +74,7 @@ def _ficha_charla(h: dict[str, Any]) -> str:
     if h.get("madura"):
         datos.append("marcada como +18")
     desc = " ".join((h.get("descripcion") or "").split())
-    sinopsis = (desc[:600] + "…") if len(desc) > 600 else (desc or "(no tienes su sinopsis)")
+    sinopsis = (desc[:350] + "…") if len(desc) > 350 else (desc or "(no tienes su sinopsis)")
     return "- " + " | ".join(datos) + f"\n  Sinopsis: {sinopsis}"
 
 
@@ -323,6 +323,9 @@ class Biblioteca(commands.Cog):
     def invalidar(self, todo: bool = False) -> None:
         if todo:
             self._cache.clear()
+            # Guardan IDs de historias, que son distintos en la base real y en la de pruebas
+            self._recientes.clear()
+            self._ultimas_canal.clear()
         else:
             self._cache.pop(en_prueba(), None)
 
@@ -548,7 +551,7 @@ class Biblioteca(commands.Cog):
             elegidas.insert(0, nombrada)
         if not elegidas:
             return ""
-        lineas = [_ficha_charla(h) for h in elegidas[:4]]
+        lineas = [_ficha_charla(h) for h in elegidas[:3]]
         return (
             "FICHAS DE LAS HISTORIAS DE LAS QUE SE ESTÁ HABLANDO (datos reales de tu biblioteca; si te preguntan "
             "por ellas, usa esto y no inventes nada que no esté aquí):\n" + "\n".join(lineas)

@@ -22,9 +22,9 @@ from typing import Any, Iterable, Optional
 
 MAX_ENTRADAS_CANAL = 40           # Mensajes recordados por canal
 MAX_CANALES = 300                 # Canales en memoria (se descartan los menos activos)
-VENTANA_SEGUNDOS = 2 * 60 * 60    # Lo más antiguo que se le pasa a la IA
-MAX_CARACTERES_ENTRADA = 700      # Recorte por mensaje
-PRESUPUESTO_CARACTERES = 8000     # Tope de toda la conversación enviada a la IA
+VENTANA_SEGUNDOS = 60 * 60        # Lo más antiguo que se le pasa a la IA
+MAX_CARACTERES_ENTRADA = 450      # Recorte por mensaje
+PRESUPUESTO_CARACTERES = 4500     # Tope de toda la conversación enviada a la IA
 _MAX_EMBEDS = 4
 
 ROL_USUARIO = "user"
