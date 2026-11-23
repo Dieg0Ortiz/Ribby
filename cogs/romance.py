@@ -45,7 +45,7 @@ import logros as lg
 import ribby_lore as lr
 import temporadas
 import comun
-from comun import es_admin
+from comun import es_admin, md
 
 log = logging.getLogger("bot-literario.afinidad")
 
@@ -207,7 +207,7 @@ class CitaView(discord.ui.View):
         self.stop()
         embed = discord.Embed(
             title=self.cita["titulo"],
-            description=f"{self.cita['escena']}\n\n**{self.usuario.display_name}:** {texto}\n\n**Ribby:** {reaccion}"
+            description=f"{self.cita['escena']}\n\n**{md(self.usuario.display_name)}:** {texto}\n\n**Ribby:** {reaccion}"
                         f"{_texto_logros(nuevos)}",
             color=COLOR_ROMANCE if delta > 0 else config.COLOR_ADVERTENCIA,
         )
@@ -281,7 +281,7 @@ class EventoView(_SoloAutor):
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await interaction.followup.send(
-            f"**{self.usuario.display_name}** le regala {datos['nombre'].lower()} a Ribby.\n> {datos['respuesta']}"
+            f"**{md(self.usuario.display_name)}** le regala {datos['nombre'].lower()} a Ribby.\n> {datos['respuesta']}"
             f"{_texto_logros(nuevos)}"
         )
 
@@ -503,15 +503,22 @@ class Afinidad(commands.Cog):
 
     # ── Integración con Saludos ──
 
-    async def procesar_mensaje(self, message: discord.Message, texto: str, tono: str) -> Resultado:
-        """Actualiza la relación con quien le habla y devuelve el contexto para la IA."""
+    async def procesar_mensaje(
+        self, message: discord.Message, texto: str, tono: str, coqueteo: Optional[bool] = None
+    ) -> Resultado:
+        """
+        Actualiza la relación con quien le habla y devuelve el contexto para la IA.
+        `tono` y `coqueteo` vienen del análisis del mensaje (Hugging Face o reglas).
+        """
+        if coqueteo is None:
+            coqueteo = af.es_coqueteo(texto)
         usuario = message.author
         estado = await self.cargar(usuario.id)
         pareja = await database.pareja_actual(self.db)
         ocupada = bool(pareja and pareja["usuario_discord_id"] != str(usuario.id))
         nombre_pareja = pareja["nombre_display"] if ocupada and pareja else None
 
-        _, previo, nuevo = af.aplicar_interaccion(estado, tono, af.es_coqueteo(texto), ocupada)
+        _, previo, nuevo = af.aplicar_interaccion(estado, tono, coqueteo, ocupada)
         resultado = Resultado(subio_nivel=_orden(nuevo) > _orden(previo))
 
         declaracion = af.declarar(estado, ocupada) if af.es_declaracion(texto) else None
@@ -583,7 +590,7 @@ class Afinidad(commands.Cog):
         if mision and mision["historia_id"] == historia["id"]:
             minutos = (datetime.now(timezone.utc) - mision["fecha_asignada"]).total_seconds() / 60
             if minutos < MINUTOS_MINIMOS_MISION:
-                return (f"🤨 ¿Ya te leíste **{historia['titulo']}**? Hace {int(minutos)} minutos que te la encargué. "
+                return (f"🤨 ¿Ya te leíste **{md(historia['titulo'])}**? Hace {int(minutos)} minutos que te la encargué. "
                         "Guardé tu reseña, pero la misión la daré por cumplida cuando haya pasado al menos una hora.")
             await database.completar_mision(self.db, mision["id"])
             nuevos = await self.aplicar_actividad(
@@ -793,7 +800,7 @@ class Afinidad(commands.Cog):
         if momentos:
             embed.add_field(
                 name="Momentos juntos",
-                value="\n".join(f"`{e['fecha']}` {e['texto']}" for e in reversed(momentos))[:1024],
+                value="\n".join(f"`{e['fecha']}` {md(e['texto'])}" for e in reversed(momentos))[:1024],
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -813,7 +820,7 @@ class Afinidad(commands.Cog):
             contador="regalos_total", extra_logros=("escarabajo",) if regalo.value == "bicho" else (),
         )
         await interaction.response.send_message(
-            f"**{interaction.user.display_name}** le regala {datos['nombre'].lower()} a Ribby.\n> {random.choice(datos['respuestas'])}"
+            f"**{md(interaction.user.display_name)}** le regala {datos['nombre'].lower()} a Ribby.\n> {random.choice(datos['respuestas'])}"
         )
         if nuevos:
             await interaction.followup.send(_texto_logros(nuevos).strip(), ephemeral=True)
@@ -877,7 +884,7 @@ class Afinidad(commands.Cog):
             if historia:
                 embeds = await biblioteca.tarjetas([historia])  # type: ignore[attr-defined]
                 return await interaction.followup.send(
-                    f"📖 Tu misión sigue siendo **{historia['titulo']}**. Cuando la termines, cuéntame qué te pareció "
+                    f"📖 Tu misión sigue siendo **{md(historia['titulo'])}**. Cuando la termines, cuéntame qué te pareció "
                     "con `/biblioteca resenar`. ¿O prefieres otra?",
                     embeds=embeds, view=CambiarMisionView(self, interaction.user),
                     allowed_mentions=discord.AllowedMentions.none(),
@@ -987,7 +994,7 @@ class Afinidad(commands.Cog):
             if abierto:
                 disponibles.append(cap)
                 marca = "✅" if cap["id"] in leidos else "🆕"
-                lineas.append(f"{marca} **{cap['titulo']}**")
+                lineas.append(f"{marca} **{md(cap['titulo'])}**")
             else:
                 lineas.append(f"🔒 {cap['titulo'].split('·')[0].strip()} — *cuando Ribby te vea como «{af.NIVELES[cap['nivel']][0]}»*")
 

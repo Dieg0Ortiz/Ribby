@@ -33,7 +33,7 @@ import database
 import recomendador as rec
 import wattpad
 from ai_providers import ProviderManager
-from comun import en_prueba, es_admin, es_admin_miembro, refrescar_urls
+from comun import en_prueba, es_admin, es_admin_miembro, refrescar_urls, md
 
 log = logging.getLogger("bot-literario.biblioteca")
 
@@ -135,9 +135,9 @@ class AyudaFichaView(discord.ui.View):
             self.stop()
             if self.ayudantes:
                 nombres = ", ".join(f"<@{u}>" for u in self.ayudantes)
-                final = f"🎀 ¡Gracias, {nombres}! Ya actualicé mi ficha de **{self.historia['titulo']}**. ...No es que lo necesitara, pero se agradece."
+                final = f"🎀 ¡Gracias, {nombres}! Ya actualicé mi ficha de **{md(self.historia['titulo'])}**. ...No es que lo necesitara, pero se agradece."
             else:
-                final = f"📚 Bueno, seguiré investigando **{self.historia['titulo']}** por mi cuenta."
+                final = f"📚 Bueno, seguiré investigando **{md(self.historia['titulo'])}** por mi cuenta."
             return await interaction.response.edit_message(content=final, view=None, allowed_mentions=_SIN_PING)
         await self.preparar()
         await interaction.response.edit_message(content=self.contenido(), view=self)
@@ -239,7 +239,7 @@ class PedirResumenView(discord.ui.View):
             self.stop()
             await inter.response.edit_message(view=None)
             await inter.followup.send(
-                f"📖 <@{self.solicitante_id}>, aquí tienes de qué trata **{self.historia['titulo']}** "
+                f"📖 <@{self.solicitante_id}>, aquí tienes de qué trata **{md(self.historia['titulo'])}** "
                 f"(gracias, {inter.user.mention}~ ya lo guardé en mi biblioteca):\n>>> {texto[:1700]}",
                 allowed_mentions=discord.AllowedMentions(users=[discord.Object(self.solicitante_id)]),
             )
@@ -349,7 +349,7 @@ class Biblioteca(commands.Cog):
                 continue
             texto = (
                 f"🔔 **¡{'Capítulo nuevo' if cuantas == 1 else f'{cuantas} capítulos nuevos'}!** "
-                f"**{h['titulo']}** de {h.get('autor_nombre') or 'su autor'} acaba de actualizarse "
+                f"**{md(h['titulo'])}** de {md(h.get('autor_nombre') or 'su autor')} acaba de actualizarse "
                 f"(ya va por {h.get('partes')} partes). 📖\n{h.get('url') or ''}"
             )
             try:
@@ -378,14 +378,14 @@ class Biblioteca(commands.Cog):
     def _tarjeta(self, h: dict[str, Any], vigentes: dict[str, str]) -> discord.Embed:
         pdf = vigentes.get(h.get("url_pdf") or "", h.get("url_pdf"))
         enlace = h.get("url") or pdf
-        autor = h.get("autor_nombre") or "Autor desconocido"
+        autor = md(h.get("autor_nombre") or "Autor desconocido")
         if h.get("autor_discord"):
             autor += f" (<@{h['autor_discord']}>)"
 
         desc = (h.get("descripcion") or "").strip()
         if len(desc) > 380:
             desc = desc[:380].rsplit(" ", 1)[0] + "…"
-        cuerpo = f"✍️ Por **{autor}**\n\n{desc or '*Todavía no tengo el resumen de esta historia.*'}"
+        cuerpo = f"✍️ Por **{autor}**\n\n{md(desc) if desc else '*Todavía no tengo el resumen de esta historia.*'}"
 
         embed = discord.Embed(
             title=(h.get("titulo") or "Sin título")[:256],
@@ -395,7 +395,7 @@ class Biblioteca(commands.Cog):
         )
         tags = [t for t in (h.get("tags") or []) if t not in _TAGS_OCULTOS]
         if tags:
-            embed.add_field(name="🏷️  Etiquetas", value=", ".join(tags[:20])[:1024], inline=False)
+            embed.add_field(name="🏷️  Etiquetas", value=md(", ".join(tags[:20]))[:1024], inline=False)
 
         if h.get("fuente") == "wattpad" or h.get("wattpad_id"):
             estado = "✅ Terminada" if h.get("completada") else "✍️ En curso"
@@ -471,7 +471,7 @@ class Biblioteca(commands.Cog):
         for h in historias:
             preguntas = rec.preguntas_pendientes(h, self.pokemon)
             if preguntas:
-                view = AyudaFichaView(self, dict(h), preguntas, f"Por cierto, de **{h['titulo']}** sé muy poco... ¿me ayudas? 🎀")
+                view = AyudaFichaView(self, dict(h), preguntas, f"Por cierto, de **{md(h['titulo'])}** sé muy poco... ¿me ayudas? 🎀")
                 await view.preparar()
                 view.message = await canal.send(view.contenido(), view=view, allowed_mentions=_SIN_PING)
                 return
@@ -530,7 +530,7 @@ class Biblioteca(commands.Cog):
         self.invalidar()
         historias = [h for h in await self.catalogo() if h["id"] in añadidas + conocidas]
         if añadidas:
-            texto = f"📚 ¡Nueva historia para mi biblioteca! Gracias, {message.author.display_name}~ La guardaré con cuidado."
+            texto = f"📚 ¡Nueva historia para mi biblioteca! Gracias, {md(message.author.display_name)}~ La guardaré con cuidado."
         else:
             texto = "Esa ya estaba en mis estantes 😌 pero actualicé sus datos."
         await message.reply(texto, embeds=await self.tarjetas(historias), mention_author=False, allowed_mentions=_SIN_PING)
@@ -550,7 +550,7 @@ class Biblioteca(commands.Cog):
         desc = (historia.get("descripcion") or "").strip()
         if desc:
             await message.reply(
-                f"📖 **{historia['titulo']}**, de {historia.get('autor_nombre') or 'autor desconocido'}:\n>>> {desc[:1800]}",
+                f"📖 **{md(historia['titulo'])}**, de {md(historia.get('autor_nombre') or 'autor desconocido')}:\n>>> {md(desc[:1800])}",
                 mention_author=False, allowed_mentions=_SIN_PING,
             )
             return
@@ -559,14 +559,14 @@ class Biblioteca(commands.Cog):
         autor = historia.get("autor_discord")
         if autor:
             await message.reply(
-                f"No tengo el resumen de **{historia['titulo']}** 😶 <@{autor}>, {message.author.mention} quiere saber "
+                f"No tengo el resumen de **{md(historia['titulo'])}** 😶 <@{autor}>, {message.author.mention} quiere saber "
                 f"de qué trata tu historia. ¿Le cuentas? Usa el botón y me lo quedo para la próxima 🎀",
                 view=view, mention_author=False,
                 allowed_mentions=discord.AllowedMentions(users=[discord.Object(int(autor)), message.author]),
             )
         else:
             await message.reply(
-                f"No tengo el resumen de **{historia['titulo']}** y no sé quién la escribió aquí en Discord 😶 "
+                f"No tengo el resumen de **{md(historia['titulo'])}** y no sé quién la escribió aquí en Discord 😶 "
                 "¿Alguien que la haya leído me ayuda con un resumen?",
                 view=view, mention_author=False, allowed_mentions=_SIN_PING,
             )
@@ -648,8 +648,8 @@ class Biblioteca(commands.Cog):
         )
         self.invalidar()
         await interaction.response.send_message(
-            f"🏷️ Añadí {nuevas} etiqueta(s) nueva(s) a **{h['titulo']}**. Gracias~" if nuevas
-            else f"**{h['titulo']}** ya tenía esas etiquetas 😌",
+            f"🏷️ Añadí {nuevas} etiqueta(s) nueva(s) a **{md(h['titulo'])}**. Gracias~" if nuevas
+            else f"**{md(h['titulo'])}** ya tenía esas etiquetas 😌",
             ephemeral=True,
         )
 
@@ -695,7 +695,7 @@ class Biblioteca(commands.Cog):
         resenas = await database.resenas_de_historia(self.db, h["id"], limite=6)
         if not resenas:
             return await interaction.response.send_message(
-                f"**{h['titulo']}** aún no tiene reseñas. ¿Serás la primera persona? `/biblioteca resenar` 🖋️",
+                f"**{md(h['titulo'])}** aún no tiene reseñas. ¿Serás la primera persona? `/biblioteca resenar` 🖋️",
                 ephemeral=True,
             )
         embed = discord.Embed(
@@ -726,8 +726,8 @@ class Biblioteca(commands.Cog):
         autor = h.get("autor_discord")
         aviso_autor = f"\n\n<@{autor}>, ¡tienes una reseña nueva! 🎀" if autor and nueva else ""
         contenido = (
-            f"🖋️ **{interaction.user.display_name}** {'reseñó' if nueva else 'actualizó su reseña de'} "
-            f"**{h['titulo']}**  {'⭐' * puntuacion}{'☆' * (5 - puntuacion)}\n>>> {texto[:1500]}{aviso_autor}"
+            f"🖋️ **{md(interaction.user.display_name)}** {'reseñó' if nueva else 'actualizó su reseña de'} "
+            f"**{md(h['titulo'])}**  {'⭐' * puntuacion}{'☆' * (5 - puntuacion)}\n>>> {texto[:1500]}{aviso_autor}"
         )
         await interaction.response.send_message(
             contenido,
@@ -749,8 +749,8 @@ class Biblioteca(commands.Cog):
             )
         nueva = await database.seguir_historia(self.db, interaction.user.id, h["id"])
         await interaction.response.send_message(
-            f"🔔 Te avisaré cuando **{h['titulo']}** tenga capítulos nuevos." if nueva
-            else f"Ya seguías **{h['titulo']}** 😌",
+            f"🔔 Te avisaré cuando **{md(h['titulo'])}** tenga capítulos nuevos." if nueva
+            else f"Ya seguías **{md(h['titulo'])}** 😌",
             ephemeral=True,
         )
 
@@ -761,7 +761,7 @@ class Biblioteca(commands.Cog):
         h = await self._resolver(historia)
         ok = bool(h) and await database.dejar_de_seguir(self.db, interaction.user.id, h["id"])  # type: ignore[index]
         await interaction.response.send_message(
-            f"🔕 Ya no te avisaré de **{h['titulo']}**." if ok else "No seguías esa historia 🤔",  # type: ignore[index]
+            f"🔕 Ya no te avisaré de **{md(h['titulo'])}**." if ok else "No seguías esa historia 🤔",  # type: ignore[index]
             ephemeral=True,
         )
 
@@ -772,12 +772,27 @@ class Biblioteca(commands.Cog):
         historias = [h for h in await self.catalogo() if str(h.get("autor_discord") or "") == str(objetivo.id)]
         if not historias:
             yo = objetivo.id == interaction.user.id
-            return await interaction.response.send_message(
-                ("No tengo historias tuyas en mis estantes 🤔 Vincula tu cuenta con `/biblioteca vincular_wattpad` "
-                 "o regístrate en un reto." if yo else f"No conozco historias de {objetivo.display_name} todavía 🤔"),
-                ephemeral=True,
-            )
-        await interaction.response.defer()
+            cuentas = await database.wattpad_de_discord(self.db, objetivo.id)
+            if cuentas:
+                # Tiene cuenta vinculada pero aún no hay historias suyas: se intenta traerlas ahora
+                await interaction.response.defer()
+                for cuenta in cuentas:
+                    await self.importar_autor(cuenta)
+                historias = [h for h in await self.catalogo() if str(h.get("autor_discord") or "") == str(objetivo.id)]
+                if not historias:
+                    return await interaction.followup.send(
+                        f"Tengo vinculada la cuenta de Wattpad **{md(', '.join(cuentas))}**, pero no encontré historias "
+                        "públicas en ella 🤔",
+                        ephemeral=True,
+                    )
+            else:
+                texto = ("No tengo historias tuyas en mis estantes 🤔 Vincula tu cuenta con `/biblioteca vincular_wattpad` "
+                         "o regístrate en un reto." if yo else f"No conozco historias de {md(objetivo.display_name)} todavía 🤔")
+                if en_prueba():
+                    texto += "\n🧪 *Estás en modo de pruebas: la biblioteca de pruebas empieza vacía (`/prueba sembrar`).*"
+                return await interaction.response.send_message(texto, ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         ids = [h["id"] for h in historias]
         lecturas = sum(h.get("lecturas") or 0 for h in historias)
         votos = sum(h.get("votos") or 0 for h in historias)
@@ -791,7 +806,7 @@ class Biblioteca(commands.Cog):
 
         embed = discord.Embed(
             title=f"✍️  {objetivo.display_name}",
-            description=(f"🔗 Wattpad: " + ", ".join(f"[{w}](https://www.wattpad.com/user/{w})" for w in wattpads)
+            description=(f"🔗 Wattpad: " + ", ".join(f"[{md(w)}](https://www.wattpad.com/user/{w})" for w in wattpads)
                          if wattpads else "*Sin cuenta de Wattpad vinculada*"),
             color=config.COLOR_PRINCIPAL,
         )
@@ -809,7 +824,7 @@ class Biblioteca(commands.Cog):
             datos = f"👁️ {_num(h.get('lecturas'))} · ⭐ {_num(h.get('votos'))}" if h.get("wattpad_id") else "🏆 Reto"
             if h.get("num_resenas"):
                 datos += f" · 🖋️ {h['nota_media']}"
-            titulo = f"[{h['titulo'][:60]}]({h['url']})" if h.get("url") else h["titulo"][:60]
+            titulo = f"[{md(h['titulo'][:60])}]({h['url']})" if h.get("url") else md(h["titulo"][:60])
             lineas.append(f"• {titulo} — {datos}")
         embed.add_field(name="Sus historias", value="\n".join(lineas)[:1024], inline=False)
 
@@ -827,12 +842,30 @@ class Biblioteca(commands.Cog):
         nombre = wattpad.usuario_de_url(usuario)
         if not nombre:
             return await interaction.response.send_message("Eso no parece un usuario de Wattpad 🤨", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
         await database.vincular_autor_wattpad(self.db, nombre, str(interaction.user.id))
-        self.invalidar()
-        await interaction.response.send_message(
-            f"🔗 Listo: **{nombre}** en Wattpad eres tú. Te avisaré cuando alguien quiera saber de tus historias.",
+        total, nuevas = await self.importar_autor(nombre, str(interaction.user.id))
+        if total:
+            detalle = (f"Encontré **{total}** historia(s) tuya(s) en Wattpad" +
+                       (f" y añadí **{nuevas}** nueva(s) a mi biblioteca" if nuevas else ", ya las tenía todas") +
+                       ". Mira tu perfil con `/biblioteca autor`. 📚")
+        else:
+            detalle = ("No encontré historias públicas en esa cuenta 🤔 Si el nombre está bien, publica alguna "
+                       "o añádelas con `/biblioteca agregar`.")
+        await interaction.followup.send(
+            f"🔗 Listo: **{md(nombre)}** en Wattpad eres tú. Te avisaré cuando alguien quiera saber de tus historias.\n{detalle}",
             ephemeral=True,
         )
+
+    async def importar_autor(self, username: str, agregada_por: Optional[str] = None) -> tuple[int, int]:
+        """Añade a la biblioteca todas las historias públicas de un autor de Wattpad. Retorna (total, nuevas)."""
+        historias = await wattpad.historias_de_usuario(username)
+        nuevas = 0
+        for datos in historias:
+            _, nueva = await database.guardar_historia_wattpad(self.db, datos, agregada_por)
+            nuevas += int(nueva)
+        self.invalidar()
+        return len(historias), nuevas
 
     @grupo.command(name="eliminar", description="(Staff) Quita una historia de la biblioteca")
     @app_commands.describe(historia="Título de la historia")
@@ -849,7 +882,7 @@ class Biblioteca(commands.Cog):
             )
         await database.eliminar_historia_biblioteca(self.db, h["id"])
         self.invalidar()
-        await interaction.response.send_message(f"🗑️ Quité **{h['titulo']}** de la biblioteca.", ephemeral=True)
+        await interaction.response.send_message(f"🗑️ Quité **{md(h['titulo'])}** de la biblioteca.", ephemeral=True)
 
     @grupo.command(name="sincronizar", description="(Staff) Actualiza la biblioteca desde Wattpad ahora")
     @app_commands.describe(lista="(Opcional) Enlace de otra lista de lectura de Wattpad para importar")

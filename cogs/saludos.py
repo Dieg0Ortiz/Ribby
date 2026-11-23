@@ -21,6 +21,7 @@ import config
 import database
 import afinidad
 import comun
+import hugging_face
 import personalidad as ribby
 from ai_providers import ProviderManager
 
@@ -500,6 +501,23 @@ class Saludos(commands.Cog):
             "cómo les ves con /ribby corazones, hacerte regalos con /ribby regalar e invitarte a una cita con /ribby cita.\n"
         )
 
+    async def _responder_moderacion(self, message: discord.Message, texto: str, analisis) -> None:
+        """Mensaje tóxico o sexual: Ribby lo corta sin pasárselo a la IA, y cuenta como grosería."""
+        log.info(f"🛡️ Mensaje de {message.author.display_name} bloqueado por moderación ({analisis.motivo})")
+        estado = await self._obtener_estado(message.author.id)
+        self._actualizar_mood(estado, "grosero")
+        romance = self.bot.get_cog("Afinidad")
+        if romance is not None:
+            try:
+                await romance.procesar_mensaje(message, texto, "grosero", False)  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"No se pudo actualizar la relación tras moderar: {e}")
+        try:
+            await message.reply(hugging_face.respuesta_moderacion(), mention_author=False, allowed_mentions=_SIN_MENCIONES)
+        except discord.HTTPException:
+            pass
+        await self._marcar_prueba(message)
+
     @staticmethod
     async def _marcar_prueba(message: discord.Message) -> None:
         """En modo de pruebas, Ribby marca sus respuestas con 🧪 para que no haya dudas."""
@@ -545,6 +563,13 @@ class Saludos(commands.Cog):
             return
         self._ultimo_uso_ia[message.author.id] = ahora
 
+        # Análisis del mensaje (Hugging Face; si no está disponible, palabras clave):
+        # tono para los corazones y el humor de Ribby, y moderación
+        analisis = await hugging_face.analizar(texto, _detectar_tono(texto), afinidad.es_coqueteo(texto))
+        if analisis.bloquear:
+            await self._responder_moderacion(message, texto, analisis)
+            return
+
         # Recomendaciones, links de Wattpad y "¿de qué trata...?" los atiende la biblioteca
         biblioteca = self.bot.get_cog("Biblioteca")
         if biblioteca is not None:
@@ -563,7 +588,9 @@ class Saludos(commands.Cog):
         relacion = None
         if romance is not None:
             try:
-                relacion = await romance.procesar_mensaje(message, texto, _detectar_tono(texto))  # type: ignore[attr-defined]
+                relacion = await romance.procesar_mensaje(  # type: ignore[attr-defined]
+                    message, texto, analisis.tono, analisis.coqueteo
+                )
             except Exception as e:  # noqa: BLE001
                 log.exception(f"Error en el medidor de corazones: {e}")
 
@@ -577,9 +604,9 @@ class Saludos(commands.Cog):
                 # ── 1. Recuperar o inicializar estado del usuario (carga BD si es 1ra vez) ──
                 estado = await self._obtener_estado(message.author.id)
 
-                # ── 2. Detectar tono del mensaje ──
-                tono = _detectar_tono(texto)
-                log.debug(f"Tono detectado para {message.author.display_name}: {tono}")
+                # ── 2. Tono del mensaje (ya analizado arriba) ──
+                tono = analisis.tono
+                log.debug(f"Tono de {message.author.display_name}: {tono} ({analisis.fuente})")
 
                 # ── 3. Actualizar mood según el tono ──
                 self._actualizar_mood(estado, tono)

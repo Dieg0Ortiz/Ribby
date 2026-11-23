@@ -215,6 +215,14 @@ async def refrescar_participantes(bot: discord.Client, participantes: list[dict[
 
 # ─────────────────────────── Formato ───────────────────────────
 
+def md(texto: Any) -> str:
+    """
+    Protege un texto para mostrarlo tal cual en Discord: sin esto, un usuario como
+    "-_CAS_-" se ve en cursiva ("-CAS-") y un título con "||" se convierte en spoiler.
+    """
+    return discord.utils.escape_markdown(str(texto if texto is not None else ""))
+
+
 def fecha_corta(valor: Any) -> str:
     """'YYYY-MM-DD' a partir de un datetime o de un string ISO; 'N/A' si no hay."""
     if not valor:

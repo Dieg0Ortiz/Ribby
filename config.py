@@ -38,6 +38,15 @@ GEMINI_API_KEY: str = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
 
+# Hugging Face (opcional): análisis de tono, moderación y respaldo de conversación.
+# Necesita un token con el permiso "Inference Providers" (https://huggingface.co/settings/tokens).
+HF_TOKEN: str = os.getenv("HF_TOKEN", "")
+HF_CHAT_MODEL: str = os.getenv("HF_CHAT_MODEL", "meta-llama/Llama-3.3-70B-Instruct:cheapest")
+HF_MODELO_TONO: str = os.getenv("HF_MODELO_TONO", "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7")
+HF_MODELO_TOXICIDAD: str = os.getenv("HF_MODELO_TOXICIDAD", "textdetox/xlmr-large-toxicity-classifier")
+# Probabilidad de toxicidad a partir de la cual Ribby corta el mensaje (0–1)
+UMBRAL_TOXICIDAD: float = float(os.getenv("UMBRAL_TOXICIDAD", "0.85"))
+
 # Otros proveedores (opcionales, de respaldo)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")

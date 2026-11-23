@@ -134,7 +134,7 @@ async def sembrar_biblioteca_pruebas(pool: Any) -> int:
             return ", ".join(f'{alias}"{f["attname"]}"' for f in filas)
 
         async with conn.transaction():
-            for tabla in ("biblioteca_etiquetas", "biblioteca_historias", "autores_wattpad"):
+            for tabla in ("biblioteca_etiquetas", "biblioteca_historias"):
                 await conn.execute(f"DELETE FROM {ESQUEMA_PRUEBAS}.{tabla}")
             cols = await columnas("biblioteca_historias")
             # Las historias de retos apuntan a participantes reales que no existen en pruebas
@@ -150,7 +150,8 @@ async def sembrar_biblioteca_pruebas(pool: Any) -> int:
             )
             cols = await columnas("autores_wattpad")
             await conn.execute(
-                f"INSERT INTO {ESQUEMA_PRUEBAS}.autores_wattpad ({cols}) SELECT {cols} FROM public.autores_wattpad"
+                f"INSERT INTO {ESQUEMA_PRUEBAS}.autores_wattpad ({cols}) SELECT {cols} FROM public.autores_wattpad "
+                f"ON CONFLICT DO NOTHING"
             )
             return await conn.fetchval(f"SELECT COUNT(*) FROM {ESQUEMA_PRUEBAS}.biblioteca_historias") or 0
 
@@ -1206,6 +1207,13 @@ async def vincular_autor_wattpad(pool: asyncpg.Pool, wattpad_username: str, disc
             "ON CONFLICT (wattpad_username) DO UPDATE SET discord_id = EXCLUDED.discord_id, fecha = NOW()",
             wattpad_username, discord_id,
         )
+
+
+async def wattpad_de_discord(pool: asyncpg.Pool, discord_id) -> list[str]:
+    """Cuentas de Wattpad vinculadas a un usuario de Discord."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT wattpad_username FROM autores_wattpad WHERE discord_id = $1", str(discord_id))
+        return [r["wattpad_username"] for r in rows]
 
 
 async def eliminar_historia_biblioteca(pool: asyncpg.Pool, historia_id: int) -> bool:

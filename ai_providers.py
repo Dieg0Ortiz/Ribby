@@ -1,7 +1,7 @@
 """
 ai_providers.py — Proveedores de IA con respaldo en cadena.
 
-Orden: Claude → Gemini (rota entre varias llaves) → Groq → OpenRouter.
+Orden: Claude → Hugging Face → Groq (Gemini y OpenRouter al final, si tienen clave).
 Solo se usan los que tengan su API key configurada.
 Todos reciben el mismo formato: un system prompt y un historial
 [{"role": "user" | "ribby", "content": str}, ...].
@@ -10,6 +10,7 @@ Todos reciben el mismo formato: un system prompt y un historial
 from __future__ import annotations
 
 import logging
+import re
 
 import aiohttp
 import anthropic
@@ -174,6 +175,8 @@ class OpenAICompatibleProvider(AIProvider):
                 data = await resp.json()
 
         contenido = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        # Algunos modelos abiertos incluyen su razonamiento entre <think>...</think>: no se muestra
+        contenido = re.sub(r"<think>.*?</think>", "", contenido, flags=re.S | re.I)
         if not contenido.strip():
             raise RuntimeError(f"Respuesta vacía de {self.nombre}")
         return contenido.strip()
@@ -185,16 +188,22 @@ class ProviderManager:
     def __init__(self, config):
         self.providers: list[AIProvider] = []
 
-        # Claude va primero; los demás solo se usan como respaldo si están configurados
+        # Orden: Claude → Hugging Face → Groq. Gemini y OpenRouter van al final y
+        # solo si siguen teniendo clave configurada.
         if config.ANTHROPIC_API_KEY:
             self.providers.append(ClaudeProvider(config.ANTHROPIC_API_KEY, config.CLAUDE_MODEL))
-        if config.GEMINI_API_KEYS:
-            self.providers.append(GeminiProvider(config.GEMINI_API_KEYS, config.GEMINI_MODEL))
+        if config.HF_TOKEN:
+            self.providers.append(OpenAICompatibleProvider(
+                "Hugging Face", config.HF_TOKEN, config.HF_CHAT_MODEL,
+                "https://router.huggingface.co/v1/chat/completions",
+            ))
         if config.GROQ_API_KEY:
             self.providers.append(OpenAICompatibleProvider(
                 "Groq", config.GROQ_API_KEY, config.GROQ_MODEL,
                 "https://api.groq.com/openai/v1/chat/completions",
             ))
+        if config.GEMINI_API_KEYS:
+            self.providers.append(GeminiProvider(config.GEMINI_API_KEYS, config.GEMINI_MODEL))
         if config.OPENROUTER_API_KEY:
             self.providers.append(OpenAICompatibleProvider(
                 "OpenRouter", config.OPENROUTER_API_KEY, config.OPENROUTER_MODEL,

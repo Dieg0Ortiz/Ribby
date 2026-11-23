@@ -101,7 +101,24 @@ Cada usuario tiene de 0 a 100 corazones. Según los corazones, Ribby le ve como:
 
 ---
 
-## 🧪 6. Modo de pruebas
+## 🛡️ 6. Moderación y análisis de mensajes (Hugging Face)
+
+Cuando alguien menciona a Ribby, antes de responder analiza el mensaje con dos modelos de Hugging Face:
+
+- **Tono:** si es amable, grosero, un coqueteo o neutral. De esto dependen los corazones y el humor de Ribby, y es mucho más preciso que buscar palabras sueltas: entiende el sarcasmo, las faltas de ortografía y frases como "no eres nada fea".
+- **Moderación:** si el mensaje es **ofensivo o tiene contenido sexual explícito**, Ribby no lo procesa. Responde cortante y la persona pierde corazones como si hubiera sido grosera.
+
+Si Hugging Face no responde, Ribby vuelve sola al método antiguo de palabras clave y sigue funcionando.
+
+**Cómo activarlo:** crea un token en https://huggingface.co/settings/tokens con el permiso **"Inference Providers"** y añádelo en Railway como `HF_TOKEN`. Hugging Face ya no tiene nivel gratuito para esto: hace falta la cuenta **PRO** (incluye $2 de crédito al mes) o comprar créditos. El análisis cuesta fracciones de céntimo por mensaje, así que el crédito del PRO da de sobra.
+
+**Ajuste fino:** si Ribby corta mensajes que no son ofensivos, sube `UMBRAL_TOXICIDAD` en Railway (por defecto `0.85`, máximo `1`). Si deja pasar demasiado, bájalo.
+
+**Respaldo de conversación:** con el mismo token, Hugging Face actúa como respaldo de Claude para conversar (modelo Llama 3.3 70B). El orden es Claude → Hugging Face → Groq. Las claves de Gemini y OpenRouter ya no funcionan: puedes borrarlas de Railway.
+
+---
+
+## 🧪 7. Modo de pruebas
 
 Sirve para probar cualquier función sin ensuciar los datos reales de La Comarca. Solo pueden usarlo el staff y Tainy.
 
@@ -139,7 +156,7 @@ En modo de pruebas, **Ribby trata a Tainy como a un usuario normal**, para que p
 
 ---
 
-## 🛠️ 7. Problemas frecuentes
+## 🛠️ 8. Problemas frecuentes
 
 | Problema | Qué hacer |
 |---|---|
@@ -147,6 +164,7 @@ En modo de pruebas, **Ribby trata a Tainy como a un usuario normal**, para que p
 | Ribby no felicita cumpleaños, ni anuncia eventos, ni saluda | Falta `/ribby canal`. |
 | La biblioteca está vacía | `/biblioteca sincronizar`. |
 | Ribby responde con frases fijas en vez de conversar | Su IA no está disponible en ese momento (cuota o caída del servicio); vuelve sola. |
+| Ribby corta mensajes normales como si fueran ofensivos | Sube `UMBRAL_TOXICIDAD` en Railway (por ejemplo a `0.92`). |
 | Alguien abusa del sistema de corazones | `/ribby reiniciar usuario:@alguien`. |
 | Una historia no debería estar en la biblioteca | `/biblioteca eliminar`. |
 | Un autor no puede corregir el resumen de su historia | Tiene que vincular su cuenta con `/biblioteca vincular_wattpad`. |

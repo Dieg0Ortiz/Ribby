@@ -17,6 +17,7 @@ import config
 import database
 import personalidad as ribby
 from comun import (
+    md,
     en_servidores_configurados,
     es_admin,
     fecha_corta,
@@ -143,13 +144,13 @@ def _embed_participante(p: dict, idx: int, total: int, evento_nombre: str) -> di
 
     # ── Título y contenido ──
     desc_partes = [
-        f"## ✍️  {titulo}",
+        f"## ✍️  {md(titulo)}",
         f"{config.SEPARADOR}",
         "",
     ]
 
     # Info del autor
-    desc_partes.append(f"👤  **Autor:**  {p['usuario_nombre']}")
+    desc_partes.append(f"👤  **Autor:**  {md(p['usuario_nombre'])}")
 
     # Fecha de registro
     if p.get("fecha_registro"):
@@ -329,7 +330,7 @@ class InfoPaginadaView(_VistaConTimeout):
         embed = discord.Embed(
             title="📥  Documento Listo",
             description=(
-                f"Aquí tienes la historia _{titulo}_ de **{p['usuario_nombre']}**:\n\n"
+                f"Aquí tienes la historia _{md(titulo)}_ de **{md(p['usuario_nombre'])}**:\n\n"
                 f"[⬇️  **Haz clic aquí para descargar**]({url})"
             ),
             color=config.COLOR_EXITO,
@@ -404,8 +405,8 @@ class HistorialSelect(discord.ui.Select):
             embed.add_field(
                 name="🏆  Ganador",
                 value=(
-                    f"**{ganador['usuario_nombre']}**\n"
-                    f"╰ _{titulo_ganador}_  •  **{ganador['total_votos']}** voto(s)"
+                    f"**{md(ganador['usuario_nombre'])}**\n"
+                    f"╰ _{md(titulo_ganador)}_  •  **{ganador['total_votos']}** voto(s)"
                 ),
                 inline=False,
             )
@@ -415,7 +416,7 @@ class HistorialSelect(discord.ui.Select):
             lineas = []
             for i, p in enumerate(participantes, 1):
                 titulo = p["titulo_historia"] or "Sin título"
-                linea = f"`{i}.`  **{p['usuario_nombre']}**  —  _{titulo}_"
+                linea = f"`{i}.`  **{md(p['usuario_nombre'])}**  —  _{md(titulo)}_"
                 links = []
                 if p["url_pdf"]:
                     links.append(f"[📄 Doc]({p['url_pdf']})")
@@ -548,7 +549,7 @@ class Historial(commands.Cog):
         resumen_lineas = []
         for i, e in enumerate(eventos[:10], 1):
             fecha = fecha_corta(e["fecha_cierre"])
-            resumen_lineas.append(f"`{i}.`  **{e['nombre'][:80]}**  •  📅 {fecha}")
+            resumen_lineas.append(f"`{i}.`  **{md(e['nombre'][:80])}**  •  📅 {fecha}")
 
         embed = discord.Embed(
             title="📜  Historial de Retos Literarios",

@@ -44,6 +44,16 @@ class TestComun(unittest.TestCase):
     def test_limitar_bloque_vacio(self):
         self.assertEqual(comun.limitar_bloque_embed([]), "​")
 
+    def test_nombres_con_caracteres_especiales(self):
+        import wattpad
+        # Los guiones bajos se conservan al guardar...
+        self.assertEqual(wattpad.usuario_de_url("-_CAS_-"), "-_CAS_-")
+        self.assertEqual(wattpad.usuario_de_url("https://www.wattpad.com/user/-_CAS_-"), "-_CAS_-")
+        # ...y al mostrarlos no se convierten en cursiva, negrita ni spoiler
+        self.assertEqual(comun.md("-_CAS_-"), "\\-\\_CAS\\_-")  # El guion inicial también (Discord lo tomaría por lista)
+        self.assertEqual(comun.md("||  And If I  ||"), "\\|\\|  And If I  \\|\\|")
+        self.assertEqual(comun.md(None), "")
+
     def test_fecha_corta(self):
         self.assertEqual(comun.fecha_corta("2026-11-22T10:00:00+00:00"), "2026-11-22")
         self.assertEqual(comun.fecha_corta(datetime(2026, 1, 2, tzinfo=timezone.utc)), "2026-01-02")
@@ -453,6 +463,120 @@ class TestModoPruebas(unittest.TestCase):
         e["ultima_interaccion"] = (af.ahora() - timedelta(days=90)).isoformat()
         self.assertEqual(af.aplicar_paso_del_tiempo(e), [])  # Su cariño no se enfría
         self.assertIn("CREADOR", af.contexto_prompt(e, False, evento_declaracion="creador"))
+
+
+class TestHuggingFace(unittest.TestCase):
+    """Un servidor local imita la API de Hugging Face (sin red ni token real)."""
+
+    def _con_servidor(self, rutas, prueba):
+        from aiohttp import web
+        import config
+        import hugging_face as hf
+
+        recibido = []
+
+        async def main():
+            app = web.Application()
+            for ruta, respuesta in rutas.items():
+                async def handler(request, respuesta=respuesta):
+                    recibido.append((request.path, request.headers.get("Authorization"), await request.json()))
+                    if isinstance(respuesta, int):
+                        return web.Response(status=respuesta, text="caído")
+                    return web.json_response(respuesta)
+                app.router.add_post(ruta, handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            sitio = web.TCPSite(runner, "127.0.0.1", 0)
+            await sitio.start()
+            puerto = sitio._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{puerto}"
+            antes = (hf._URL_MODELO, config.HF_TOKEN)
+            hf._URL_MODELO, config.HF_TOKEN = base + "/hf-inference/models/{modelo}", "hf_falso"
+            try:
+                return await prueba(base)
+            finally:
+                hf._URL_MODELO, config.HF_TOKEN = antes
+                await runner.cleanup()
+
+        return asyncio.run(main()), recibido
+
+    def _rutas(self, tonos, toxico):
+        import config
+        import hugging_face as hf
+        desc = list(hf.CATEGORIAS.values())
+        return {
+            f"/hf-inference/models/{config.HF_MODELO_TONO}": [
+                {"label": desc[list(hf.CATEGORIAS).index(k)], "score": v} for k, v in tonos.items()
+            ],
+            f"/hf-inference/models/{config.HF_MODELO_TOXICIDAD}": [[
+                {"label": "toxic", "score": toxico}, {"label": "neutral", "score": 1 - toxico},
+            ]],
+        }
+
+    def test_coqueteo_detectado_aunque_las_palabras_clave_no_lo_vean(self):
+        import hugging_face as hf
+        rutas = self._rutas({"coqueteo": 0.8, "amable": 0.1, "grosero": 0.02, "sexual": 0.03, "neutro": 0.05}, 0.02)
+
+        async def prueba(_):
+            return await hf.analizar("no eres nada fea, la verdad", "neutro", False)
+
+        r, recibido = self._con_servidor(rutas, prueba)
+        self.assertEqual((r.tono, r.coqueteo, r.bloquear, r.fuente), ("amable", True, False, "hugging_face"))
+        ruta, auth, cuerpo = next(x for x in recibido if "candidate_labels" in str(x[2]))
+        self.assertEqual(auth, "Bearer hf_falso")
+        self.assertEqual(cuerpo["parameters"]["hypothesis_template"], "Este mensaje es {}.")
+        self.assertEqual(len(cuerpo["parameters"]["candidate_labels"]), 5)
+
+    def test_moderacion_por_toxicidad_y_por_contenido_sexual(self):
+        import hugging_face as hf
+        toxico = self._rutas({"grosero": 0.9, "amable": 0.02, "coqueteo": 0.02, "sexual": 0.03, "neutro": 0.03}, 0.97)
+        sexual = self._rutas({"sexual": 0.85, "coqueteo": 0.1, "amable": 0.02, "grosero": 0.02, "neutro": 0.01}, 0.3)
+
+        async def prueba(_):
+            return await hf.analizar("mensaje de prueba", "neutro", False)
+
+        r, _ = self._con_servidor(toxico, prueba)
+        self.assertEqual((r.bloquear, r.motivo, r.tono), (True, "toxicidad", "grosero"))
+        r, _ = self._con_servidor(sexual, prueba)
+        self.assertEqual((r.bloquear, r.motivo), (True, "sexual"))
+
+    def test_si_hugging_face_cae_se_usan_las_reglas(self):
+        import config
+        import hugging_face as hf
+        rutas = {f"/hf-inference/models/{config.HF_MODELO_TONO}": 503,
+                 f"/hf-inference/models/{config.HF_MODELO_TOXICIDAD}": 503}
+
+        async def prueba(_):
+            return await hf.analizar("eres una idiota", "grosero", False)
+
+        r, _ = self._con_servidor(rutas, prueba)
+        self.assertEqual((r.tono, r.bloquear, r.fuente), ("grosero", False, "reglas"))
+        # Y sin token ni siquiera se intenta
+        self.assertEqual(asyncio.run(hf.analizar("hola Ribby", "amable", False)).fuente, "reglas")
+
+    def test_proveedor_de_chat_y_limpieza_de_razonamiento(self):
+        import config
+        respuesta = {"choices": [{"message": {"role": "assistant", "content": "<think>pienso...</think>Hm. Hola. 🎀"}}]}
+
+        async def prueba(base):
+            prov = ai_providers.OpenAICompatibleProvider(
+                "Hugging Face", "hf_falso", config.HF_CHAT_MODEL, base + "/v1/chat/completions"
+            )
+            return await prov.generate("eres Ribby", [{"role": "user", "content": "hola"}])
+
+        texto, recibido = self._con_servidor({"/v1/chat/completions": respuesta}, prueba)
+        self.assertEqual(texto, "Hm. Hola. 🎀")
+        _, auth, cuerpo = recibido[0]
+        self.assertEqual(auth, "Bearer hf_falso")
+        self.assertEqual(cuerpo["model"], "meta-llama/Llama-3.3-70B-Instruct:cheapest")
+        self.assertEqual(cuerpo["messages"][0], {"role": "system", "content": "eres Ribby"})
+
+    def test_orden_de_proveedores(self):
+        from types import SimpleNamespace as NS
+        cfg = NS(ANTHROPIC_API_KEY="a", CLAUDE_MODEL="claude-haiku-5-5", HF_TOKEN="h", HF_CHAT_MODEL="m",
+                 GROQ_API_KEY="g", GROQ_MODEL="x", GEMINI_API_KEYS=[], OPENROUTER_API_KEY="", OPENROUTER_MODEL="")
+        nombres = [p.nombre for p in ai_providers.ProviderManager(cfg).providers]
+        self.assertEqual(nombres, ["Claude", "Hugging Face", "Groq"])
 
 
 class TestWattpadUrls(unittest.TestCase):

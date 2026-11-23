@@ -123,6 +123,25 @@ async def historias_de_lista(list_id: str) -> list[dict[str, Any]]:
     return resultado
 
 
+async def historias_de_usuario(username: str) -> list[dict[str, Any]]:
+    """Historias públicas de un autor de Wattpad (paginando)."""
+    from urllib.parse import quote
+
+    resultado: list[dict[str, Any]] = []
+    url: Optional[str] = f"{_BASE}/users/{quote(username, safe='')}/stories"
+    params: Optional[dict] = {"limit": 50, "offset": 0, "fields": f"stories({_CAMPOS_HISTORIA}),nextUrl"}
+    async with aiohttp.ClientSession(headers=_HEADERS, timeout=_TIMEOUT) as s:
+        for _ in range(20):  # Tope de seguridad: 1000 historias
+            data = await _get_json(s, url, params)  # type: ignore[arg-type]
+            if not data:
+                break
+            resultado += [_normalizar(r) for r in data.get("stories", []) if r.get("id")]
+            url, params = data.get("nextUrl"), None
+            if not url:
+                break
+    return resultado
+
+
 async def nombres_pokemon() -> set[str]:
     """Nombres de las especies Pokémon (PokeAPI), en minúsculas. Vacío si falla."""
     try:

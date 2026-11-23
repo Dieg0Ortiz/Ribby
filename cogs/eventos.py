@@ -21,7 +21,7 @@ from typing import Optional
 import config
 import database
 import personalidad as ribby
-from comun import es_admin as _es_admin, limitar_bloque_embed as _limitar_bloque_embed
+from comun import es_admin as _es_admin, limitar_bloque_embed as _limitar_bloque_embed, md
 
 
 def _pct(valor: float) -> str:
@@ -31,7 +31,7 @@ def _pct(valor: float) -> str:
 def _embed_error(titulo: str, descripcion: str) -> discord.Embed:
     """Crea un embed de error estilizado."""
     embed = discord.Embed(
-        description=f"**{titulo}**\n\n{descripcion}",
+        description=f"**{md(titulo)}**\n\n{descripcion}",
         color=config.COLOR_ERROR,
     )
     embed.set_author(name="⛔  Error", icon_url=config.BOT_ICON_URL or None)
@@ -41,7 +41,7 @@ def _embed_error(titulo: str, descripcion: str) -> discord.Embed:
 def _embed_advertencia(titulo: str, descripcion: str) -> discord.Embed:
     """Crea un embed de advertencia estilizado."""
     embed = discord.Embed(
-        description=f"**{titulo}**\n\n{descripcion}",
+        description=f"**{md(titulo)}**\n\n{descripcion}",
         color=config.COLOR_ADVERTENCIA,
     )
     embed.set_author(name="⚠️  Advertencia", icon_url=config.BOT_ICON_URL or None)
@@ -80,7 +80,7 @@ class Eventos(commands.Cog):
             return await interaction.response.send_message(
                 embed=_embed_advertencia(
                     "Evento activo existente",
-                    f"Ya existe un evento activo: **{activo['nombre']}** (ID: `{activo['id']}`).\n"
+                    f"Ya existe un evento activo: **{md(activo['nombre'])}** (ID: `{activo['id']}`).\n"
                     f"Ciérralo primero con `/evento cerrar`."
                 ),
                 ephemeral=True,
@@ -177,7 +177,7 @@ class Eventos(commands.Cog):
             title="⚙️  Evento Configurado",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**  •  ID: `{activo['id']}`\n\n"
+                f"📖  **{md(activo['nombre'])}**  •  ID: `{activo['id']}`\n\n"
                 f"{canales_texto}\n\n"
                 f"{config.SEPARADOR}"
             ),
@@ -236,7 +236,7 @@ class Eventos(commands.Cog):
             title="🗳️  Votos Configurados",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**  •  ID: `{activo['id']}`\n\n"
+                f"📖  **{md(activo['nombre'])}**  •  ID: `{activo['id']}`\n\n"
                 f"{descripcion_votos}\n\n"
                 f"{config.SEPARADOR}"
             ),
@@ -328,7 +328,7 @@ class Eventos(commands.Cog):
             title=f"🎙️  Narración #{numero_sesion}  —  ¡En Vivo!",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"{ribby.frase(ribby.NARRACION)}\n\n"
                 f"{config.SEPARADOR}"
             ),
@@ -422,7 +422,7 @@ class Eventos(commands.Cog):
             title=f"⏹️  Narración #{numero_sesion} Cerrada",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"La sesión de narración ha terminado.\n"
                 f"El evento sigue **abierto** — puedes iniciar otra narración cuando quieras.\n\n"
                 f"{config.SEPARADOR}"
@@ -559,7 +559,7 @@ class Eventos(commands.Cog):
             title="🗳️  ¡Votación Abierta!",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"{ribby.frase(ribby.VOTACION)}\n\n"
                 f"La votación para este reto ya está disponible.\n"
                 f"Usa `/votar` para emitir tu voto de forma anónima.{votos_info}\n\n"
@@ -594,7 +594,7 @@ class Eventos(commands.Cog):
             title="🔒  Reporte de Habilitados (Solo Admin)",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"Aquí tienes el desglose del sistema antifraude.\n"
                 f"Los usuarios que **no** aparezcan en la lista de habilitados\n"
                 f"podrán votar, pero su voto será **anulado silenciosamente**.\n\n"
@@ -688,7 +688,7 @@ class Eventos(commands.Cog):
             title="🏆  Evento Finalizado",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"{ribby.frase(ribby.EVENTO_CERRADO)}\n\n"
                 f"{ribby.descripcion_biblioteca(libros)}\n\n"
                 f"{config.SEPARADOR}"
@@ -704,7 +704,7 @@ class Eventos(commands.Cog):
                 medalla = podio_emojis[i] if i < len(podio_emojis) else f"`#{i+1}`"
                 titulo = r["titulo_historia"] or "Sin título"
                 votos_txt = f"**{r['total_votos']}** voto{'s' if r['total_votos'] != 1 else ''}"
-                tabla_lineas.append(f"{medalla}  **{r['usuario_nombre']}**\n╰ _{titulo}_  •  {votos_txt}")
+                tabla_lineas.append(f"{medalla}  **{md(r['usuario_nombre'])}**\n╰ _{md(titulo)}_  •  {votos_txt}")
 
             embed.add_field(
                 name="📊  Resultados",
@@ -718,7 +718,7 @@ class Eventos(commands.Cog):
                 embed.add_field(
                     name=f"{config.SEPARADOR_CORTO}",
                     value=(
-                        f"🎉  **¡Felicidades, {ganador['usuario_nombre']}!**\n"
+                        f"🎉  **¡Felicidades, {md(ganador['usuario_nombre'])}!**\n"
                         f"Tu historia _{ganador['titulo_historia'] or 'Sin título'}_ "
                         f"tendrá un lugar especial en la biblioteca de Ribby~ 🎀"
                     ),
@@ -744,7 +744,7 @@ class Eventos(commands.Cog):
             title="🔒  Reporte de Votos (Solo Admin)",
             description=(
                 f"{config.SEPARADOR}\n\n"
-                f"📖  **{activo['nombre']}**\n\n"
+                f"📖  **{md(activo['nombre'])}**\n\n"
                 f"Desglose final de la votación:\n\n"
                 f"{config.SEPARADOR}"
             ),

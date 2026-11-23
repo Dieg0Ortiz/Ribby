@@ -26,7 +26,7 @@ from discord.ext import commands
 
 import config
 import database
-from comun import en_servidores_configurados
+from comun import en_servidores_configurados, md
 
 OPCIONES_POR_MENU = 25
 MAX_MENUS = 5
@@ -89,7 +89,7 @@ class VotoSelect(discord.ui.Select):
         options = [
             discord.SelectOption(
                 label=f"{indice_inicial + i}. {p['titulo_historia'] or 'Sin título'}"[:100],
-                description=f"✍️ por {p['usuario_nombre']}"[:100],
+                description=f"✍️ por {md(p['usuario_nombre'])}"[:100],
                 value=str(p["id"]),
                 emoji="📖",
             )
@@ -219,7 +219,7 @@ class Votacion(commands.Cog):
 
         cabecera = (
             f"{config.SEPARADOR}\n\n"
-            f"📖  **{activo['nombre']}**\n\n"
+            f"📖  **{md(activo['nombre'])}**\n\n"
             "Selecciona la historia que más te gustó\n"
             "en el menú desplegable de abajo.\n\n"
             f"{config.SEPARADOR_CORTO}\n\n"
@@ -230,7 +230,7 @@ class Votacion(commands.Cog):
         lineas: list[str] = []
         presupuesto = LIMITE_DESCRIPCION - len(cabecera) - len(pie) - 40
         for i, p in enumerate(participantes, 1):
-            linea = f"`{i}.`  **{p['titulo_historia'] or 'Sin título'}**  —  *{p['usuario_nombre']}*"
+            linea = f"`{i}.`  **{p['titulo_historia'] or 'Sin título'}**  —  *{md(p['usuario_nombre'])}*"
             if sum(len(x) + 1 for x in lineas) + len(linea) > presupuesto:
                 lineas.append(f"*... y {len(participantes) - i + 1} más (ver menús)*")
                 break

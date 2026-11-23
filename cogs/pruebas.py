@@ -28,6 +28,7 @@ import afinidad as af
 import comun
 import config
 import database
+from comun import md
 import temporadas
 
 log = logging.getLogger("bot-literario.pruebas")
@@ -204,7 +205,7 @@ class Pruebas(commands.Cog):
             pareja = await database.pareja_actual(self.db)
             if pareja and pareja["usuario_discord_id"] != str(interaction.user.id):
                 return await interaction.response.send_message(
-                    f"En pruebas, Ribby ya tiene pareja ({pareja['nombre_display']}). Usa `/prueba reiniciar`.", ephemeral=True
+                    f"En pruebas, Ribby ya tiene pareja ({md(pareja['nombre_display'])}). Usa `/prueba reiniciar`.", ephemeral=True
                 )
             estado.update(es_pareja=True, fecha_inicio_pareja=af.ahora().isoformat())
         await romance.guardar(interaction.user, estado)  # type: ignore[union-attr]
@@ -330,9 +331,9 @@ class Pruebas(commands.Cog):
         interesados = await database.interesados_en_historia(self.db, h["id"])
         if not interesados:
             return await interaction.response.send_message(
-                f"Nadie sigue **{h['titulo']}** en pruebas. Usa antes `/biblioteca seguir`.", ephemeral=True
+                f"Nadie sigue **{md(h['titulo'])}** en pruebas. Usa antes `/biblioteca seguir`.", ephemeral=True
             )
-        await interaction.response.send_message(f"🧪 Simulando capítulo nuevo de **{h['titulo']}**...", ephemeral=True)
+        await interaction.response.send_message(f"🧪 Simulando capítulo nuevo de **{md(h['titulo'])}**...", ephemeral=True)
         await biblioteca.avisar_capitulos([(h["id"], 1)], canal=interaction.channel)  # type: ignore[union-attr]
 
     @capitulo_nuevo.autocomplete("historia")

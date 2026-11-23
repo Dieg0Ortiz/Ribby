@@ -23,7 +23,7 @@ import database
 import personalidad as ribby
 import comun
 import wattpad as wattpad_api
-from comun import en_servidores_configurados, es_admin as _es_admin
+from comun import en_servidores_configurados, es_admin as _es_admin, md
 
 log = logging.getLogger("bot-literario.participantes")
 
@@ -172,14 +172,19 @@ class Participantes(commands.Cog):
                         if datos.get("autor_wattpad"):
                             await database.vincular_autor_wattpad(self.db, datos["autor_wattpad"], autor_id)
                         historia_id = wid
-                        notas.append(f"🔗 Vinculada con tu historia de Wattpad: **{datos['titulo']}**")
+                        notas.append(f"🔗 Vinculada con tu historia de Wattpad: **{md(datos['titulo'])}**")
                     else:
                         notas.append("⚠️ No pude leer ese enlace de Wattpad (¿es público?).")
                 else:
                     nombre = wattpad_api.usuario_de_url(enlace_wattpad)
                     if nombre:
                         await database.vincular_autor_wattpad(self.db, nombre, autor_id)
-                        notas.append(f"🔗 Perfil de Wattpad vinculado: **{nombre}**")
+                        notas.append(f"🔗 Perfil de Wattpad vinculado: **{md(nombre)}**")
+                        biblioteca = self.bot.get_cog("Biblioteca")
+                        if biblioteca is not None:
+                            total, nuevas = await biblioteca.importar_autor(nombre, autor_id)  # type: ignore[attr-defined]
+                            if total:
+                                notas.append(f"📚 {total} historia(s) tuya(s) de Wattpad en la biblioteca ({nuevas} nueva(s))")
                     else:
                         notas.append("⚠️ Ese enlace de Wattpad no lo reconozco.")
 
@@ -300,8 +305,8 @@ class Participantes(commands.Cog):
                         prefijo = "📄 Documento" if es_documento else "🖼️ Portada"
                         msg_respaldo = await canal_respaldo.send(
                             content=(
-                                f"{prefijo} de **{message.author.display_name}** "
-                                f"— Evento: {activo['nombre']}"
+                                f"{prefijo} de **{md(message.author.display_name)}** "
+                                f"— Evento: {md(activo['nombre'])}"
                             ),
                             file=file,
                         )
