@@ -1,10 +1,12 @@
 """
-cogs/pruebas.py — Modo de pruebas de Ribby (solo staff y su creador).
+cogs/pruebas.py — Modo de pruebas de Ribby (lo activan el staff y su creador).
 
-Con /prueba activar, TODO lo que hagas tú (comandos, botones, mensajes,
-canal de voz) se guarda en el esquema "pruebas" de la base de datos, una copia
-vacía con la misma estructura. El resto de usuarios sigue usando los datos
-reales aunque estéis en el mismo canal.
+/prueba activar pone a Ribby ENTERA en modo de pruebas: a partir de ese momento
+todo lo que haga cualquier usuario (comandos, botones, mensajes, canal de voz)
+y las tareas automáticas se guardan en el esquema "pruebas" de la base de
+datos, una copia con la misma estructura. Los datos reales no se tocan hasta
+que alguien use /prueba desactivar. En los servidores de pruebas
+(config.GUILDS_PRUEBAS) todo usa siempre la base de pruebas.
 
 En modo de pruebas también hay atajos para probar sin esperar días:
 nivel de relación, reinicio de límites diarios, viajar en el tiempo, forzar
@@ -31,7 +33,7 @@ import temporadas
 log = logging.getLogger("bot-literario.pruebas")
 
 COLOR_PRUEBAS = 0x22D3EE
-_CLAVE = "modo_prueba:"
+_CLAVE = "modo_prueba:global"
 
 # Corazones con los que se deja cada nivel (y coqueteos para poder superar "mejor amigo")
 _NIVELES_PRUEBA = {
@@ -49,22 +51,24 @@ class Pruebas(commands.Cog):
         self.db = bot.db  # type: ignore[attr-defined]
 
     async def cog_load(self):
-        """Recupera quién estaba en modo de pruebas antes de reiniciar el bot."""
+        """Si Ribby se reinició con el modo de pruebas activado, sigue activado."""
         try:
             with comun.contexto_real():
-                claves = await database.config_con_prefijo(self.db, _CLAVE)
-            comun.usuarios_en_prueba.update(int(k[len(_CLAVE):]) for k in claves if k[len(_CLAVE):].isdigit())
+                activo = await database.config_obtener(self.db, _CLAVE)
+            comun.activar_modo_global(bool(activo))
+            if activo:
+                log.warning("🧪 Ribby arranca en MODO DE PRUEBAS (los datos reales no se tocan)")
         except Exception as e:  # noqa: BLE001
             log.warning(f"No se pudo cargar el modo de pruebas: {e}")
 
     # ── Utilidades ──
 
-    def _limpiar_caches(self, usuario_id: int) -> None:
+    def _limpiar_caches(self) -> None:
         """Al cambiar de modo, nada de lo que Ribby tenga en memoria debe mezclar datos de ambos mundos."""
         saludos = self.bot.get_cog("Saludos")
         if saludos is not None:
-            getattr(saludos, "_estado_usuarios", {}).pop(usuario_id, None)
-            getattr(saludos, "_ultimo_uso_ia", {}).pop(usuario_id, None)
+            getattr(saludos, "_estado_usuarios", {}).clear()
+            getattr(saludos, "_ultimo_uso_ia", {}).clear()
         biblioteca = self.bot.get_cog("Biblioteca")
         if biblioteca is not None:
             biblioteca.invalidar(todo=True)  # type: ignore[attr-defined]
@@ -73,7 +77,7 @@ class Pruebas(commands.Cog):
         if not _puede_probar(interaction):
             await interaction.response.send_message("⛔ El modo de pruebas es solo para el staff.", ephemeral=True)
             return False
-        if not comun.en_prueba(interaction.user.id):
+        if not comun.en_prueba():
             await interaction.response.send_message(
                 "🧪 Este atajo solo funciona en modo de pruebas (para no tocar datos reales). Usa `/prueba activar`.",
                 ephemeral=True,
@@ -90,55 +94,77 @@ class Pruebas(commands.Cog):
         name="prueba", description="🧪 Modo de pruebas de Ribby (staff)", guild_ids=config.GUILD_IDS or None,
     )
 
-    @grupo.command(name="activar", description="Entra en modo de pruebas: todo lo que hagas irá a la base de datos de pruebas")
+    @grupo.command(name="activar", description="Pone a Ribby en modo de pruebas para TODOS hasta que se desactive")
     async def activar(self, interaction: discord.Interaction):
         if not _puede_probar(interaction):
             return await interaction.response.send_message("⛔ El modo de pruebas es solo para el staff.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
+        if comun.modo_global():
+            return await interaction.response.send_message(
+                "🧪 El modo de pruebas ya estaba activado. Para salir: `/prueba desactivar`.", ephemeral=True
+            )
+        await interaction.response.defer()
         await database.preparar_esquema_pruebas(self.db)
         with comun.contexto_real():
-            await database.config_guardar(self.db, f"{_CLAVE}{interaction.user.id}", "1")
-        comun.usuarios_en_prueba.add(interaction.user.id)
-        self._limpiar_caches(interaction.user.id)
-        creador = "\n• Como eres su creador, en pruebas Ribby te trata como a un usuario normal para que puedas probar el romance." \
-            if comun.es_creador(interaction.user) else ""
-        await interaction.followup.send(
-            "🧪 **Modo de pruebas ACTIVADO.**\n"
-            "• Todo lo que hagas (comandos, botones, hablar con Ribby, canal de voz) se guarda en la base de pruebas.\n"
-            "• Los demás usuarios siguen usando los datos reales.\n"
-            "• La biblioteca de pruebas empieza vacía: usa `/prueba sembrar` para copiar la real.\n"
-            f"• Ribby marcará con 🧪 sus respuestas mientras estés en pruebas.{creador}\n\n"
-            "Atajos: `/prueba nivel`, `/prueba diario`, `/prueba tiempo`, `/prueba evento`, `/prueba celebrar`, "
-            "`/prueba iniciativa`, `/prueba capitulo_nuevo`, `/prueba reiniciar`.",
-            ephemeral=True,
+            await database.config_guardar(self.db, _CLAVE, str(interaction.user.id))
+        comun.activar_modo_global(True)
+        self._limpiar_caches()
+        embed = discord.Embed(
+            title="🧪  Modo de pruebas ACTIVADO",
+            description=(
+                f"{interaction.user.mention} ha puesto a Ribby en modo de pruebas.\n\n"
+                "**Desde ahora, todo lo que hagáis con Ribby (cualquier persona) es de prueba:** corazones, retos, "
+                "votos, reseñas... se guardan aparte y **no cuentan de verdad**. Ribby marca sus respuestas con 🧪.\n\n"
+                "Para volver a la normalidad: **`/prueba desactivar`**."
+            ),
+            color=COLOR_PRUEBAS,
         )
+        embed.add_field(
+            name="Para el staff",
+            value="La biblioteca de pruebas empieza vacía: `/prueba sembrar`.\n"
+                  "Atajos: `/prueba nivel` · `diario` · `tiempo` · `evento` · `celebrar` · `iniciativa` · "
+                  "`capitulo_nuevo` · `reiniciar` · `estado`",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
-    @grupo.command(name="desactivar", description="Sal del modo de pruebas y vuelve a los datos reales")
+    @grupo.command(name="desactivar", description="Saca a Ribby del modo de pruebas: todo vuelve a los datos reales")
     async def desactivar(self, interaction: discord.Interaction):
         if not _puede_probar(interaction):
             return await interaction.response.send_message("⛔ El modo de pruebas es solo para el staff.", ephemeral=True)
+        if not comun.modo_global():
+            texto = "El modo de pruebas no estaba activado."
+            if interaction.guild_id in config.GUILDS_PRUEBAS:
+                texto += " (Este es un servidor de pruebas: aquí todo usa siempre la base de pruebas.)"
+            return await interaction.response.send_message(texto, ephemeral=True)
         with comun.contexto_real():
-            await database.config_borrar(self.db, f"{_CLAVE}{interaction.user.id}")
-        comun.usuarios_en_prueba.discard(interaction.user.id)
-        comun.eventos_forzados.pop(interaction.user.id, None)
-        self._limpiar_caches(interaction.user.id)
-        await interaction.response.send_message(
-            "✅ **Modo de pruebas desactivado.** Vuelves a los datos reales. (Los datos de prueba se conservan "
-            "hasta que uses `/prueba reiniciar`.)",
-            ephemeral=True,
-        )
+            await database.config_borrar(self.db, _CLAVE)
+        comun.activar_modo_global(False)
+        comun.eventos_forzados.clear()
+        self._limpiar_caches()
+        await interaction.response.send_message(embed=discord.Embed(
+            title="✅  Modo de pruebas DESACTIVADO",
+            description="Ribby vuelve a la normalidad: todo lo que hagáis desde ahora **cuenta de verdad**.\n"
+                        "*(Los datos de prueba se conservan para la próxima vez, o se borran con `/prueba reiniciar`.)*",
+            color=config.COLOR_EXITO,
+        ))
 
-    @grupo.command(name="estado", description="¿Estás en modo de pruebas?")
+    @grupo.command(name="estado", description="¿Está Ribby en modo de pruebas?")
     async def estado(self, interaction: discord.Interaction):
-        activo = comun.en_prueba(interaction.user.id)
+        en_servidor_pruebas = interaction.guild_id in config.GUILDS_PRUEBAS
+        with comun.contexto_real():
+            quien = await database.config_obtener(self.db, _CLAVE)
+        if comun.modo_global():
+            texto = "🧪 Modo de pruebas **ACTIVADO para todos**" + (f" (lo activó <@{quien}>)" if quien else "")
+            texto += ".\nPara salir: `/prueba desactivar`."
+        elif en_servidor_pruebas:
+            texto = ("🧪 Este es un **servidor de pruebas**: aquí todo usa siempre la base de pruebas.\n"
+                     "En La Comarca, Ribby funciona con los datos reales.")
+        else:
+            texto = "✅ Modo de pruebas **desactivado**: Ribby usa los datos reales."
         forzado = comun.eventos_forzados.get(interaction.user.id)
-        quienes = ", ".join(f"<@{u}>" for u in sorted(comun.usuarios_en_prueba)) or "nadie"
-        await interaction.response.send_message(
-            f"🧪 Modo de pruebas: **{'ACTIVADO' if activo else 'desactivado'}**"
-            + (f"\n🎉 Evento forzado: **{forzado}**" if forzado else "")
-            + f"\n👥 En pruebas ahora mismo: {quienes}",
-            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
-        )
+        if forzado and comun.en_prueba():
+            texto += f"\n🎉 Evento forzado para ti: **{forzado}**"
+        await interaction.response.send_message(texto, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @grupo.command(name="reiniciar", description="Borra TODOS los datos de prueba y empieza de cero")
     async def reiniciar(self, interaction: discord.Interaction):
@@ -146,7 +172,7 @@ class Pruebas(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         await database.preparar_esquema_pruebas(self.db, reiniciar=True)
-        self._limpiar_caches(interaction.user.id)
+        self._limpiar_caches()
         await interaction.followup.send("🧹 Base de datos de pruebas vaciada y recreada.", ephemeral=True)
 
     @grupo.command(name="sembrar", description="Copia la biblioteca real (historias, etiquetas, autores) a la de pruebas")
@@ -155,7 +181,7 @@ class Pruebas(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         total = await database.sembrar_biblioteca_pruebas(self.db)
-        self._limpiar_caches(interaction.user.id)
+        self._limpiar_caches()
         await interaction.followup.send(
             f"🌱 Biblioteca de pruebas lista con **{total}** historias de Wattpad (las de retos no se copian).",
             ephemeral=True,

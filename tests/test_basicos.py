@@ -373,7 +373,7 @@ class TestLoreYQuiz(unittest.TestCase):
 
 class TestModoPruebas(unittest.TestCase):
     def tearDown(self):
-        comun.usuarios_en_prueba.clear()
+        comun.activar_modo_global(False)
         comun.marcar_usuario(None)
 
     def test_reescritura_de_tablas(self):
@@ -387,7 +387,7 @@ class TestModoPruebas(unittest.TestCase):
         self.assertTrue(r.endswith("FOR UPDATE"))  # "FOR UPDATE" no es una tabla
         self.assertIn("DO UPDATE SET", database.sql_para_pruebas("ON CONFLICT (a) DO UPDATE SET b = 1"))
 
-    def test_cada_usuario_va_a_su_base(self):
+    def test_modo_global_afecta_a_todos(self):
         ejecutado = []
 
         class Conn:
@@ -402,22 +402,26 @@ class TestModoPruebas(unittest.TestCase):
                 yield Conn()
 
         pool = database.PoolEnrutado(PoolFalso())
-        comun.usuarios_en_prueba.add(111)
 
-        async def consulta_como(uid):
-            comun.marcar_usuario(uid)
+        async def consulta_como(uid, servidor=123):
+            comun.marcar_usuario(uid, servidor)
             async with pool.acquire() as conn:
                 await conn.fetchval("SELECT COUNT(*) FROM eventos")
 
-        async def a_la_vez():  # Dos usuarios usando el bot al mismo tiempo
-            await asyncio.gather(consulta_como(111), consulta_como(222))
+        async def varios():
+            await asyncio.gather(consulta_como(111), consulta_como(222), consulta_como(None, None))
 
-        asyncio.run(a_la_vez())
-        self.assertIn("SELECT COUNT(*) FROM pruebas.eventos", ejecutado)
-        self.assertIn("SELECT COUNT(*) FROM eventos", ejecutado)
+        asyncio.run(varios())  # Modo desactivado: todo a la base real
+        self.assertEqual(ejecutado, ["SELECT COUNT(*) FROM eventos"] * 3)
 
-        with comun.contexto_real():
+        ejecutado.clear()
+        comun.activar_modo_global(True)
+        asyncio.run(varios())  # Activado: cualquier usuario (y tareas sin usuario) van a pruebas
+        self.assertEqual(ejecutado, ["SELECT COUNT(*) FROM pruebas.eventos"] * 3)
+
+        with comun.contexto_real():  # Guardar el interruptor siempre va a la base real
             self.assertFalse(comun.en_prueba())
+        self.assertTrue(comun.en_prueba())
 
     def test_servidor_de_pruebas_siempre_usa_la_base_de_pruebas(self):
         import config
@@ -434,7 +438,7 @@ class TestModoPruebas(unittest.TestCase):
         self.assertTrue(comun.es_creador_id(987654321))  # Se recuerda el ID
         self.assertFalse(comun.es_creador(NS(id=5, name="otra_persona")))
         self.assertTrue(comun.creador_activo(987654321))
-        comun.usuarios_en_prueba.add(987654321)
+        comun.activar_modo_global(True)
         self.assertFalse(comun.creador_activo(987654321))  # En pruebas es un usuario normal
 
     def test_afinidad_del_creador(self):

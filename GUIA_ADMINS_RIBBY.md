@@ -109,7 +109,13 @@ Sirve para probar cualquier función sin ensuciar los datos reales de La Comarca
 En el **servidor de pruebas de Tainy** (ID `1489169806128185517`), **todo usa siempre la base de datos de pruebas**, para todo el mundo y sin activar nada. Ahí se pueden crear retos, votar o enamorar a Ribby sin miedo: nada de eso llega nunca a La Comarca. Para que funcione, Ribby tiene que estar invitada a ese servidor.
 
 ### Dentro de La Comarca
-`/prueba activar`: desde ese momento, todo lo que hagas **tú** (comandos, botones, hablar con Ribby, el canal de voz) va a la base de datos de pruebas. Los demás siguen con los datos reales aunque estéis en el mismo canal. Ribby marca con 🧪 sus respuestas mientras estés en pruebas. Para volver: `/prueba desactivar`.
+- **`/prueba activar`** pone a Ribby **entera** en modo de pruebas, **para todo el mundo**. Desde ese momento, lo que haga **cualquier usuario** (corazones, retos, votos, reseñas, misiones…) se guarda aparte y **no cuenta de verdad**. Las tareas automáticas (sincronizar Wattpad, cumpleaños, saludos) también trabajan sobre la base de pruebas.
+- Ribby anuncia en el canal cuando se activa y cuando se desactiva, y marca con 🧪 sus respuestas mientras dure.
+- **`/prueba desactivar`** vuelve todo a la normalidad. Los datos de prueba se guardan para la próxima vez, o se borran con `/prueba reiniciar`.
+- **`/prueba estado`** te dice si está activado y quién lo activó.
+- Si Ribby se reinicia con el modo activado, sigue activado.
+
+⚠️ Mientras esté activo, **nada de lo que haga la comunidad en La Comarca cuenta**. Úsalo con cuidado y desactívalo al terminar. Para probar con calma, mejor el servidor de pruebas.
 
 ### Atajos
 Funcionan en modo de pruebas o en el servidor de pruebas:
@@ -125,11 +131,11 @@ Funcionan en modo de pruebas o en el servidor de pruebas:
 | `/prueba iniciativa` | Que Ribby te escriba por su cuenta ahora mismo |
 | `/prueba capitulo_nuevo` | Simular un capítulo nuevo de una historia que sigas |
 | `/prueba reiniciar` | Borrar todos los datos de prueba |
-| `/prueba estado` | Ver si estás en pruebas y quién más lo está |
+| `/prueba estado` | Ver si el modo de pruebas está activado y quién lo activó |
 
 En modo de pruebas, **Ribby trata a Tainy como a un usuario normal**, para que pueda probar todas las rutas de la relación.
 
-**Probar un reto completo en solitario:** crea el evento, registra a otra persona con `/participante_registrar usuario:@alguien` (sus datos también van a pruebas, porque el comando lo lanzas tú) y vota por su historia.
+**Probar un reto completo en solitario:** crea el evento, registra a otra persona con `/participante_registrar usuario:@alguien` y vota por su historia.
 
 ---
 

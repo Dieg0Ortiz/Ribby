@@ -56,8 +56,9 @@ Límites de la iniciativa de Ribby (para que nunca sea spam): como mucho 1 mensa
 ## 🧪 5. Modo de Pruebas
 Para probar cualquier función sin tocar los datos reales.
 
-- `/prueba activar`: desde ese momento, **todo lo que hagas tú** (comandos, botones, hablar con Ribby, canal de voz) se guarda en una base de datos de pruebas aparte. El resto del servidor sigue usando los datos reales aunque estéis en el mismo canal. Ribby marca con 🧪 sus respuestas mientras estés en pruebas.
-- `/prueba desactivar` · `/prueba estado`
+- `/prueba activar`: pone a Ribby **entera** en modo de pruebas **para todo el mundo**: lo que haga cualquier usuario se guarda en una base de datos de pruebas aparte y no cuenta de verdad. Ribby lo anuncia en el canal y marca con 🧪 sus respuestas.
+- `/prueba desactivar`: todo vuelve a la normalidad. · `/prueba estado`: ver si está activado y quién lo activó.
+- En el **servidor de pruebas** (ID 1489169806128185517) todo usa siempre la base de pruebas, sin activar nada.
 - `/prueba sembrar`: copia la biblioteca real a la de pruebas (empieza vacía).
 - `/prueba reiniciar`: borra todos los datos de prueba.
 
@@ -70,7 +71,7 @@ Para probar cualquier función sin tocar los datos reales.
 - `/prueba iniciativa`: Ribby te escribe por su cuenta ahora mismo.
 - `/prueba capitulo_nuevo`: simula que una historia que sigues publicó un capítulo.
 
-Para probar retos completos en solitario: crea el evento y registra a otra persona con `/participante_registrar usuario:@alguien` (sus datos también irán a pruebas porque el comando lo lanzas tú) y vota por su historia.
+Para probar retos completos en solitario: crea el evento, registra a otra persona con `/participante_registrar usuario:@alguien` y vota por su historia.
 
 **Nota sobre Tainy (creador de Ribby):** fuera de pruebas, Ribby le trata como a su padre (cariño de familia, corazones al máximo, nunca romance). En modo de pruebas le trata como a un usuario normal para que pueda probar todas las rutas.
 

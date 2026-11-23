@@ -25,15 +25,26 @@ log = logging.getLogger("bot-literario.comun")
 
 # ─────────────────────────── Modo de pruebas ───────────────────────────
 #
-# Cada interacción/mensaje marca en una ContextVar quién la provoca. Si esa
-# persona activó /prueba, database.PoolEnrutado manda todas sus consultas al
-# esquema "pruebas" en vez de al real. Así varios usuarios pueden usar el bot a
-# la vez sin que las pruebas de uno toquen los datos de los demás.
+# Con /prueba activar, el modo de pruebas es GLOBAL: todo lo que haga cualquier
+# usuario (y las tareas automáticas) va al esquema "pruebas" de la base de datos
+# hasta que alguien use /prueba desactivar. Además, en los servidores de pruebas
+# (config.GUILDS_PRUEBAS) todo usa siempre la base de pruebas.
+# Cada interacción marca en ContextVars quién la provoca y en qué servidor.
 
 _usuario_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_usuario", default=None)
 _servidor_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_servidor", default=None)
-usuarios_en_prueba: set[int] = set()
+_forzar_real: contextvars.ContextVar[bool] = contextvars.ContextVar("ribby_forzar_real", default=False)
+_modo_global = False
 eventos_forzados: dict[int, str] = {}  # usuario → id de evento de temporada (solo en pruebas)
+
+
+def activar_modo_global(activo: bool) -> None:
+    global _modo_global
+    _modo_global = activo
+
+
+def modo_global() -> bool:
+    return _modo_global
 
 
 def marcar_usuario(usuario: Any, servidor_id: Optional[int] = None) -> None:
@@ -55,23 +66,24 @@ def usuario_actual() -> Optional[int]:
 
 
 def en_prueba(usuario_id: Optional[int] = None) -> bool:
-    """En pruebas si la persona activó /prueba o si estamos en un servidor de pruebas."""
-    if _servidor_actual.get() in config.GUILDS_PRUEBAS:
-        return True
-    uid = usuario_id if usuario_id is not None else _usuario_actual.get()
-    return uid is not None and uid in usuarios_en_prueba
+    """
+    ¿Lo que se ejecuta ahora va a la base de pruebas? Sí si el modo de pruebas
+    global está activado o si estamos en un servidor de pruebas.
+    (`usuario_id` se acepta por compatibilidad; el modo ya no es por usuario.)
+    """
+    if _forzar_real.get():
+        return False
+    return _modo_global or _servidor_actual.get() in config.GUILDS_PRUEBAS
 
 
 @contextlib.contextmanager
 def contexto_real():
     """Dentro de este bloque las consultas van siempre a la base de datos real."""
-    token = _usuario_actual.set(None)
-    token_srv = _servidor_actual.set(None)
+    token = _forzar_real.set(True)
     try:
         yield
     finally:
-        _usuario_actual.reset(token)
-        _servidor_actual.reset(token_srv)
+        _forzar_real.reset(token)
 
 
 def instalar_contexto(bot: discord.Client) -> None:
