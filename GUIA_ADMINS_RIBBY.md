@@ -9,7 +9,7 @@ Documento interno para administradores de La Comarca: cómo funcionan las noveda
 1. **Elige el canal de Ribby:** `/ribby canal canal:#el-canal`.
    Ahí Ribby felicita cumpleaños, celebra aniversarios, anuncia los eventos de temporada, avisa de capítulos nuevos y saluda a la gente por su cuenta. **Sin canal configurado, nada de esto se publica.**
 2. **Comprueba la biblioteca:** `/biblioteca recomendar`. Ribby carga sola la lista de Wattpad *"Historias de nuestro servidor"* al arrancar y la actualiza cada 6 horas. Si sale vacía, usa `/biblioteca sincronizar`.
-3. **Anuncia las novedades** a la comunidad con el texto de `NOVEDADES_RIBBY.md`.
+3. **Anuncia las novedades** a la comunidad: cualquiera puede leerlas con `/novedades`. Esta guía se consulta en privado con `/admin_novedades` (solo staff).
 
 ---
 
@@ -67,7 +67,7 @@ Cada usuario tiene de 0 a 100 corazones. Según los corazones, Ribby le ve como:
 | Mejor amigo | 45–74 | Sin coquetear, nadie pasa de aquí |
 | Algo más que amigos | 75–99 | Hay que haberle coqueteado varias veces |
 | *Enamorada* (secreto) | 100 | Da pistas, pero **nunca se declara ella** |
-| Pareja | — | Solo si el usuario se declara estando en 100 |
+| Pareja | 100 + declararse | Solo si el usuario se declara estando en 100 |
 
 **Reglas que conviene conocer:**
 - **Hay un tope diario** de corazones charlando. Llegar al máximo solo hablando lleva unas 6 semanas; con regalos, citas y misiones diarias, unas 3–4.

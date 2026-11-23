@@ -501,7 +501,8 @@ class TestCargaDeCogs(unittest.TestCase):
                          "ribby corazones", "ribby cita", "ribby regalar", "ribby mision", "ribby evento",
                          "ribby logros", "ribby cumpleanos", "ribby avisos", "ribby canal", "biblioteca resenar",
                          "ribby historia", "ribby quiz", "biblioteca seguir", "biblioteca autor",
-                         "prueba activar", "prueba nivel", "prueba tiempo", "prueba capitulo_nuevo"]:
+                         "prueba activar", "prueba nivel", "prueba tiempo", "prueba capitulo_nuevo",
+                         "novedades", "admin_novedades"]:
             self.assertIn(esperado, nombres)
 
 

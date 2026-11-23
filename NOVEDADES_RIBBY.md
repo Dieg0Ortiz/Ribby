@@ -101,7 +101,7 @@ Si te has ganado su confianza, puede que algún día **te escriba ella primero**
 
 **Ribby:** `/ribby corazones` · `recuerdos` · `regalar` · `cita` · `mision` · `quiz` · `historia` · `logros` · `cumpleanos` · `evento` · `avisos`
 
-Y, como siempre, `/help` para el manual completo.
+Y, como siempre, `/help` para el manual completo. ¿Quieres volver a leer esto? Usa `/novedades`.
 
 ---
 

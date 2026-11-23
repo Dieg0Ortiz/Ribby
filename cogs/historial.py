@@ -28,6 +28,52 @@ from comun import (
 BASE_DIR = Path(__file__).resolve().parent.parent
 MANUAL_USUARIO_PATH = BASE_DIR / "MANUAL_DE_USUARIO.md"
 MANUAL_ADMIN_PATH = BASE_DIR / "MANUAL_ADMINISTRADORES.md"
+NOVEDADES_PATH = BASE_DIR / "NOVEDADES_RIBBY.md"
+GUIA_ADMINS_PATH = BASE_DIR / "GUIA_ADMINS_RIBBY.md"
+
+_LIMITE_EMBED = 4000  # Discord admite 4096 caracteres por descripción; se deja margen
+
+
+def _markdown_para_discord(texto: str) -> str:
+    """Discord no muestra tablas de markdown: cada fila se convierte en una línea de lista."""
+    salida: list[str] = []
+    for linea in texto.splitlines():
+        if not linea.strip().startswith("|"):
+            salida.append(linea)
+            continue
+        celdas = [c.strip() for c in linea.strip().strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in celdas):
+            continue  # Separador |---|---|
+        # La primera fila de cada tabla es el encabezado: en una lista sobra
+        if not salida or not salida[-1].startswith(("• ", "​")):
+            salida.append("​")  # Marca temporal: "aquí empieza una tabla"
+            continue
+        primera, resto = celdas[0], [c for c in celdas[1:] if c]
+        salida.append(f"• {primera}" + (f" — {' · '.join(resto)}" if resto else ""))
+    return "\n".join(l for l in salida if l != "​")
+
+
+def _trocear(texto: str, limite: int = _LIMITE_EMBED) -> list[str]:
+    """Divide un texto largo en páginas por párrafos, sin cortar a mitad de frase si se puede."""
+    if len(texto) <= limite:
+        return [texto]
+    paginas, actual = [], ""
+    for parrafo in texto.split("\n\n"):
+        candidato = f"{actual}\n\n{parrafo}" if actual else parrafo
+        if len(candidato) <= limite:
+            actual = candidato
+            continue
+        if actual:
+            paginas.append(actual)
+        while len(parrafo) > limite:  # Párrafo gigantesco: se corta por líneas
+            corte = parrafo.rfind("\n", 0, limite)
+            corte = corte if corte > 0 else limite
+            paginas.append(parrafo[:corte])
+            parrafo = parrafo[corte:].lstrip("\n")
+        actual = parrafo
+    if actual:
+        paginas.append(actual)
+    return paginas
 
 
 # ─────────────────────────── Constantes visuales ───────────────────────────
@@ -539,6 +585,41 @@ class Historial(commands.Cog):
             privado=False,
         )
 
+    # ── /novedades y /admin_novedades ──
+
+    @app_commands.command(name="novedades", description="Todo lo nuevo de Ribby 🎀")
+    @en_servidores_configurados
+    async def novedades_command(self, interaction: discord.Interaction):
+        await self._enviar_manual(
+            interaction,
+            NOVEDADES_PATH,
+            autor="Ribby 🎀 • Novedades",
+            pie="COMARCALIT",
+            color=config.COLOR_PRINCIPAL,
+            privado=False,
+        )
+
+    @app_commands.command(name="admin_novedades", description="Guía del staff para las nuevas funciones de Ribby (solo Staff)")
+    @en_servidores_configurados
+    async def admin_novedades_command(self, interaction: discord.Interaction):
+        if not es_admin(interaction):
+            embed = discord.Embed(
+                description="**⛔  Sin permisos**\n\nEsta guía es solo para el staff de La Comarca.",
+                color=config.COLOR_ERROR,
+            )
+            embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Siempre privado: revela mecánicas que son sorpresa para los usuarios
+        await self._enviar_manual(
+            interaction,
+            GUIA_ADMINS_PATH,
+            autor="🔒 Staff • Guía de la nueva Ribby",
+            pie="COMARCALIT (Confidencial)",
+            color=0x4B5563,
+            privado=True,
+        )
+
     # ── /admin_help ──
 
     @app_commands.command(name="admin_help", description="Muestra el manual de administradores de Ribby (solo Staff)")
@@ -576,14 +657,17 @@ class Historial(commands.Cog):
         except FileNotFoundError:
             return await interaction.response.send_message(f"❌ No se encontró el archivo `{ruta.name}`.", ephemeral=True)
 
-        # Separar el manual por las líneas horizontales ---
-        secciones = [sec.strip() for sec in contenido.split("\n---") if sec.strip()]
+        # Separar el manual por las líneas horizontales --- y adaptarlo a Discord
+        secciones = []
+        for sec in contenido.split("\n---"):
+            if sec.strip():
+                secciones.extend(_trocear(_markdown_para_discord(sec.strip())))
         if not secciones:
             return await interaction.response.send_message("❌ El manual está vacío.", ephemeral=True)
 
         embeds = []
         for i, seccion in enumerate(secciones, 1):
-            embed = discord.Embed(description=seccion[:4096], color=color, timestamp=datetime.now(timezone.utc))
+            embed = discord.Embed(description=seccion, color=color, timestamp=datetime.now(timezone.utc))
             embed.set_author(name=autor, icon_url=config.BOT_ICON_URL or None)
             embed.set_footer(text=f"Página {i} de {len(secciones)}  •  {pie}")
             embeds.append(embed)
