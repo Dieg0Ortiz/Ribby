@@ -20,6 +20,15 @@ _guild_raw = os.getenv("GUILD_ID", "")
 GUILD_IDS: list[int] = [int(g.strip()) for g in _guild_raw.split(",") if g.strip() and g.strip() != "0"]
 GUILD_ID: int = GUILD_IDS[0] if GUILD_IDS else 0  # Compatibilidad con código existente
 
+# Servidores de pruebas: todo lo que ocurre en ellos usa automáticamente la base de
+# datos de pruebas (nunca toca los datos reales de La Comarca).
+GUILDS_PRUEBAS: list[int] = [
+    int(g) for g in os.getenv("GUILD_PRUEBAS", "1489169806128185517").replace(" ", "").split(",") if g.isdigit()
+]
+# Los comandos también se registran en los servidores de pruebas (si se usan servidores concretos)
+if GUILD_IDS:
+    GUILD_IDS += [g for g in GUILDS_PRUEBAS if g not in GUILD_IDS]
+
 # Gemini: Puede ser una sola llave o una lista separada por comas
 _gemini_raw = os.getenv("GEMINI_API_KEY", "")
 GEMINI_API_KEYS: list[str] = [k.strip() for k in _gemini_raw.split(",") if k.strip()]

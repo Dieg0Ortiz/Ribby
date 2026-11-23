@@ -516,7 +516,7 @@ class Saludos(commands.Cog):
         # Ignorar mensajes del propio bot
         if message.author.bot:
             return
-        comun.marcar_usuario(message.author)  # Modo de pruebas: decide qué base de datos usar
+        comun.marcar_usuario(message.author, message.guild.id if message.guild else None)  # Modo de pruebas: decide qué base de datos usar
 
         # Verificar que el bot fue mencionado
         if self.bot.user not in message.mentions:

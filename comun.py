@@ -31,19 +31,23 @@ log = logging.getLogger("bot-literario.comun")
 # la vez sin que las pruebas de uno toquen los datos de los demás.
 
 _usuario_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_usuario", default=None)
+_servidor_actual: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("ribby_servidor", default=None)
 usuarios_en_prueba: set[int] = set()
 eventos_forzados: dict[int, str] = {}  # usuario → id de evento de temporada (solo en pruebas)
 
 
-def marcar_usuario(usuario: Any) -> None:
+def marcar_usuario(usuario: Any, servidor_id: Optional[int] = None) -> None:
     """
-    Indica quién provoca lo que se está ejecutando ahora (y por tanto qué base de
-    datos usar). Acepta un usuario de Discord o un ID.
+    Indica quién provoca lo que se está ejecutando ahora y en qué servidor (y por
+    tanto qué base de datos usar). Acepta un usuario de Discord o un ID.
     """
     if usuario is not None and not isinstance(usuario, int):
         es_creador(usuario)  # Recuerda el ID del creador si se le reconoce por su nombre
+        if servidor_id is None and getattr(usuario, "guild", None) is not None:
+            servidor_id = usuario.guild.id
         usuario = usuario.id
     _usuario_actual.set(usuario)
+    _servidor_actual.set(servidor_id)
 
 
 def usuario_actual() -> Optional[int]:
@@ -51,6 +55,9 @@ def usuario_actual() -> Optional[int]:
 
 
 def en_prueba(usuario_id: Optional[int] = None) -> bool:
+    """En pruebas si la persona activó /prueba o si estamos en un servidor de pruebas."""
+    if _servidor_actual.get() in config.GUILDS_PRUEBAS:
+        return True
     uid = usuario_id if usuario_id is not None else _usuario_actual.get()
     return uid is not None and uid in usuarios_en_prueba
 
@@ -59,16 +66,18 @@ def en_prueba(usuario_id: Optional[int] = None) -> bool:
 def contexto_real():
     """Dentro de este bloque las consultas van siempre a la base de datos real."""
     token = _usuario_actual.set(None)
+    token_srv = _servidor_actual.set(None)
     try:
         yield
     finally:
         _usuario_actual.reset(token)
+        _servidor_actual.reset(token_srv)
 
 
 def instalar_contexto(bot: discord.Client) -> None:
     """Engancha comandos, botones, menús y formularios para marcar al usuario de cada interacción."""
     async def check_arbol(interaction: discord.Interaction) -> bool:
-        marcar_usuario(interaction.user)
+        marcar_usuario(interaction.user, interaction.guild_id)
         return True
 
     bot.tree.interaction_check = check_arbol  # type: ignore[method-assign]
@@ -77,7 +86,7 @@ def instalar_contexto(bot: discord.Client) -> None:
         original = clase.interaction_check
 
         async def check(self, interaction: discord.Interaction, _original=original) -> bool:
-            marcar_usuario(interaction.user)
+            marcar_usuario(interaction.user, interaction.guild_id)
             return await _original(self, interaction)
 
         clase.interaction_check = check  # type: ignore[method-assign]

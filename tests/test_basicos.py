@@ -419,6 +419,14 @@ class TestModoPruebas(unittest.TestCase):
         with comun.contexto_real():
             self.assertFalse(comun.en_prueba())
 
+    def test_servidor_de_pruebas_siempre_usa_la_base_de_pruebas(self):
+        import config
+        self.assertIn(1489169806128185517, config.GUILDS_PRUEBAS)
+        comun.marcar_usuario(333, 1489169806128185517)  # Cualquiera, en el servidor de pruebas
+        self.assertTrue(comun.en_prueba())
+        comun.marcar_usuario(333, 123)                  # La misma persona en La Comarca
+        self.assertFalse(comun.en_prueba())
+
     def test_creador_por_nombre_de_usuario(self):
         from types import SimpleNamespace as NS
         tainy = NS(id=987654321, name="peso_pluma__.")

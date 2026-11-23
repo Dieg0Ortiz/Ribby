@@ -27,7 +27,7 @@ class Voz(commands.Cog):
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot:
             return
-        comun.marcar_usuario(member)  # Modo de pruebas: decide qué base de datos usar
+        comun.marcar_usuario(member, member.guild.id)  # Modo de pruebas: decide qué base de datos usar
 
         canal_antes = before.channel.id if before.channel else None
         canal_despues = after.channel.id if after.channel else None
