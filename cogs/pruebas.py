@@ -34,6 +34,14 @@ import temporadas
 log = logging.getLogger("bot-literario.pruebas")
 
 COLOR_PRUEBAS = 0x22D3EE
+# Nombres del menú de /prueba nivel. "enamorada" se muestra a los usuarios igual que "algo_mas"
+# (es un nivel secreto), pero aquí hay que distinguirlos.
+_NOMBRES_NIVEL_PRUEBA = {
+    "desconocido": "Desconocido", "amigo": "Amigo", "mejor_amigo": "Mejor amigo",
+    "algo_mas": "Algo más que amigos", "enamorada": "Enamorada (oculto: espera que te declares)",
+    "pareja": "Pareja", "familia": "Familia (solo el creador)",
+}
+
 _CLAVE = "modo_prueba:global"
 _CLAVE_CREADOR_NORMAL = "modo_prueba:creador_normal"  # Si existe, en pruebas Tainy es un usuario normal
 
@@ -220,9 +228,8 @@ class Pruebas(commands.Cog):
 
     @grupo.command(name="nivel", description="Pon tu relación con Ribby en un nivel concreto")
     @app_commands.describe(nivel="Nivel al que saltar")
-    @app_commands.choices(nivel=[app_commands.Choice(name=af.NIVELES[n][0] + (" (secreto)" if n == "enamorada" else ""), value=n)
-                                 for n in _NIVELES_PRUEBA]
-                          + [app_commands.Choice(name="👨‍👧 Familia (solo el creador)", value="familia")])
+    @app_commands.choices(nivel=[app_commands.Choice(name=_NOMBRES_NIVEL_PRUEBA[n], value=n)
+                                 for n in [*_NIVELES_PRUEBA, "familia"]])
     async def nivel(self, interaction: discord.Interaction, nivel: app_commands.Choice[str]):
         if not await self._exigir_modo(interaction):
             return
