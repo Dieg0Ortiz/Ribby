@@ -16,6 +16,13 @@ from discord.ext import commands
 import config
 import database
 import personalidad as ribby
+from comun import (
+    en_servidores_configurados,
+    es_admin,
+    fecha_corta,
+    refrescar_participantes,
+    refrescar_urls,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -100,8 +107,7 @@ def _embed_participante(p: dict, idx: int, total: int, evento_nombre: str) -> di
 
     # Fecha de registro
     if p.get("fecha_registro"):
-        fecha = p["fecha_registro"][:10]
-        desc_partes.append(f"📅  **Registrado:**  {fecha}")
+        desc_partes.append(f"📅  **Registrado:**  {fecha_corta(p['fecha_registro'])}")
 
     # Evento
     desc_partes.append(f"📖  **Evento:**  {evento_nombre[:100]}")
@@ -179,77 +185,85 @@ def _limitar_campos_embed(campos: list[tuple[str, str, bool]], limite: int) -> l
 
 # ─────────────────────────── Vista interactiva /reto info ───────────────────────────
 
-class InfoPaginadaView(discord.ui.View):
-    """Vista con botones para navegar entre resumen y participantes."""
+class _VistaConTimeout(discord.ui.View):
+    """Vista que desactiva sus componentes en el mensaje cuando expira."""
 
-    def __init__(self, db, evento: dict, participantes: list, timeout: float = 180):
+    message: discord.Message | discord.InteractionMessage | None = None
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class InfoPaginadaView(_VistaConTimeout):
+    """
+    Vista con botones para navegar entre resumen y participantes.
+
+    El mensaje de /reto info es público: si otra persona pulsa un botón, en
+    lugar de cambiarle la página a todos se le abre su propia copia privada.
+    """
+
+    def __init__(self, db, evento: dict, participantes: list, owner_id: int, pagina: int = -1, timeout: float = 180):
         super().__init__(timeout=timeout)
         self._db = db
         self.evento = evento
         self.participantes = participantes
-        self.pagina = -1  # -1 = resumen, 0..N = participantes
+        self.owner_id = owner_id
         self.total = len(participantes)
+        self.pagina = max(-1, min(pagina, self.total - 1))  # -1 = resumen, 0..N-1 = participantes
         self._actualizar_botones()
 
     def _actualizar_botones(self):
         """Habilita/deshabilita botones según la página actual."""
-        # Primera (retroceder al inicio)
-        self.btn_primero.disabled = (self.pagina <= -1)
-        # Anterior
-        self.btn_anterior.disabled = (self.pagina <= -1)
-        # Indicador de página (no interactivo)
-        if self.pagina == -1:
-            self.btn_pagina.label = "📋 Resumen"
-        else:
-            self.btn_pagina.label = f"{self.pagina + 1} / {self.total}"
-        # Siguiente
-        self.btn_siguiente.disabled = (self.pagina >= self.total - 1) or (self.total == 0)
-        # Último
-        self.btn_ultimo.disabled = (self.pagina >= self.total - 1) or (self.total == 0)
-        # Descargar Documento
-        if self.pagina == -1:
-            self.btn_descargar.disabled = True
-        else:
-            self.btn_descargar.disabled = not bool(self.participantes[self.pagina]["url_pdf"])
+        self.btn_primero.disabled = self.pagina <= -1
+        self.btn_anterior.disabled = self.pagina <= -1
+        self.btn_pagina.label = "📋 Resumen" if self.pagina == -1 else f"{self.pagina + 1} / {self.total}"
+        self.btn_siguiente.disabled = self.total == 0 or self.pagina >= self.total - 1
+        self.btn_ultimo.disabled = self.total == 0 or self.pagina >= self.total - 1
+        self.btn_descargar.disabled = self.pagina == -1 or not self.participantes[self.pagina]["url_pdf"]
 
     def _get_embed(self) -> discord.Embed:
-        """Retorna el embed correcto para la página actual."""
         if self.pagina == -1:
             return _embed_resumen_evento(self.evento, self.total)
-        else:
-            p = self.participantes[self.pagina]
-            return _embed_participante(p, self.pagina, self.total, self.evento["nombre"])
+        p = self.participantes[self.pagina]
+        return _embed_participante(p, self.pagina, self.total, self.evento["nombre"])
 
-    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary, custom_id="info_primero")
+    async def _ir_a(self, interaction: discord.Interaction, pagina: int):
+        if interaction.user.id != self.owner_id:
+            copia = InfoPaginadaView(self._db, self.evento, self.participantes, interaction.user.id, pagina)
+            await interaction.response.send_message(embed=copia._get_embed(), view=copia, ephemeral=True)
+            copia.message = await interaction.original_response()
+            return
+        self.pagina = max(-1, min(pagina, self.total - 1))
+        self._actualizar_botones()
+        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+
+    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary)
     async def btn_primero(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.pagina = -1
-        self._actualizar_botones()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+        await self._ir_a(interaction, -1)
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary, custom_id="info_anterior")
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.primary)
     async def btn_anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.pagina = max(-1, self.pagina - 1)
-        self._actualizar_botones()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+        await self._ir_a(interaction, self.pagina - 1)
 
-    @discord.ui.button(label="📋 Resumen", style=discord.ButtonStyle.secondary, disabled=True, custom_id="info_pagina")
+    @discord.ui.button(label="📋 Resumen", style=discord.ButtonStyle.secondary, disabled=True)
     async def btn_pagina(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Botón no interactivo, solo indicador
-        await interaction.response.defer()
+        await interaction.response.defer()  # Solo indicador
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, custom_id="info_siguiente")
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.primary)
     async def btn_siguiente(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.pagina = min(self.total - 1, self.pagina + 1)
-        self._actualizar_botones()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+        await self._ir_a(interaction, self.pagina + 1)
 
-    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary, custom_id="info_ultimo")
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary)
     async def btn_ultimo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.pagina = self.total - 1
-        self._actualizar_botones()
-        await interaction.response.edit_message(embed=self._get_embed(), view=self)
+        await self._ir_a(interaction, self.total - 1)
 
-    @discord.ui.button(label="📥 Descargar Documento", style=discord.ButtonStyle.success, custom_id="info_descargar")
+    @discord.ui.button(label="📥 Descargar Documento", style=discord.ButtonStyle.success)
     async def btn_descargar(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.pagina == -1:
             return await interaction.response.defer()
@@ -260,23 +274,21 @@ class InfoPaginadaView(discord.ui.View):
                 "Este participante aún no ha subido su documento.", ephemeral=True
             )
 
-        # Registrar descarga en la base de datos
-        await database.registrar_descarga(
-            self._db, self.evento["id"], str(interaction.user.id), p["id"]
-        )
+        await database.registrar_descarga(self._db, self.evento["id"], str(interaction.user.id), p["id"])
+
+        # Enlace vigente: las URLs del CDN de Discord caducan
+        url = (await refrescar_urls(interaction.client, [p["url_pdf"]])).get(p["url_pdf"], p["url_pdf"])
 
         titulo = p["titulo_historia"] or "Sin título"
         embed = discord.Embed(
             title="📥  Documento Listo",
-            description=f"Aquí tienes la historia _{titulo}_ de **{p['usuario_nombre']}**:\n\n[⬇️  **Haz clic aquí para descargar**]({p['url_pdf']})",
-            color=config.COLOR_EXITO
+            description=(
+                f"Aquí tienes la historia _{titulo}_ de **{p['usuario_nombre']}**:\n\n"
+                f"[⬇️  **Haz clic aquí para descargar**]({url})"
+            ),
+            color=config.COLOR_EXITO,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def on_timeout(self):
-        """Deshabilita todos los botones cuando expira el tiempo."""
-        for child in self.children:
-            child.disabled = True
 
 
 # ─────────────────────────── Historial Select ───────────────────────────
@@ -289,7 +301,7 @@ class HistorialSelect(discord.ui.Select):
         options = []
         for e in eventos[:25]:  # Discord limita a 25 opciones
             label = e["nombre"][:100]
-            fecha = e["fecha_cierre"][:10] if e["fecha_cierre"] else "N/A"
+            fecha = fecha_corta(e["fecha_cierre"])
             options.append(
                 discord.SelectOption(
                     label=label,
@@ -309,7 +321,12 @@ class HistorialSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         evento_id = int(self.values[0])
         evento = await database.obtener_evento_por_id(self._db, evento_id)
-        participantes = await database.obtener_participantes(self._db, evento_id)
+        if not evento:
+            return await interaction.response.send_message("Ese evento ya no existe.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        participantes = await refrescar_participantes(
+            interaction.client, await database.obtener_participantes(self._db, evento_id)
+        )
         resultados = await database.obtener_resultados_votacion(self._db, evento_id)
 
         nombre_corto = evento['nombre'][:240]
@@ -320,8 +337,8 @@ class HistorialSelect(discord.ui.Select):
             timestamp=datetime.now(timezone.utc),
         )
 
-        fecha_creacion = evento["fecha_creacion"][:10] if evento["fecha_creacion"] else "N/A"
-        fecha_cierre = evento["fecha_cierre"][:10] if evento["fecha_cierre"] else "N/A"
+        fecha_creacion = fecha_corta(evento["fecha_creacion"])
+        fecha_cierre = fecha_corta(evento["fecha_cierre"])
         duracion = evento.get("duracion_narracion_minutos", 0) or 0
 
         embed.add_field(
@@ -380,16 +397,16 @@ class HistorialSelect(discord.ui.Select):
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_footer(text="COMARCALIT  •  Retos Literarios  •  Archivo Histórico")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-class HistorialView(discord.ui.View):
+class HistorialView(_VistaConTimeout):
     def __init__(self, eventos: list, db):
         super().__init__(timeout=120)
         self.add_item(HistorialSelect(eventos, db))
 
 
-class ManualPaginadoView(discord.ui.View):
+class ManualPaginadoView(_VistaConTimeout):
     def __init__(self, embeds: list[discord.Embed]):
         super().__init__(timeout=300)
         self.embeds = embeds
@@ -404,25 +421,25 @@ class ManualPaginadoView(discord.ui.View):
         self.btn_next.disabled = is_last
         self.btn_last.disabled = is_last
 
-    @discord.ui.button(label="⏮️ Principio", style=discord.ButtonStyle.secondary, custom_id="manual_first")
+    @discord.ui.button(label="⏮️ Principio", style=discord.ButtonStyle.secondary)
     async def btn_first(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 0
         self._actualizar_botones()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.primary, custom_id="manual_prev")
+    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.primary)
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page -= 1
         self._actualizar_botones()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @discord.ui.button(label="Siguiente ▶", style=discord.ButtonStyle.primary, custom_id="manual_next")
+    @discord.ui.button(label="Siguiente ▶", style=discord.ButtonStyle.primary)
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page += 1
         self._actualizar_botones()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @discord.ui.button(label="Final ⏭️", style=discord.ButtonStyle.secondary, custom_id="manual_last")
+    @discord.ui.button(label="Final ⏭️", style=discord.ButtonStyle.secondary)
     async def btn_last(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = len(self.embeds) - 1
         self._actualizar_botones()
@@ -457,13 +474,15 @@ class Historial(commands.Cog):
             embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        participantes = await database.obtener_participantes(self.db, activo["id"])
+        await interaction.response.defer()
+        participantes = await refrescar_participantes(
+            self.bot, await database.obtener_participantes(self.db, activo["id"])
+        )
 
-        # Crear vista paginada
-        view = InfoPaginadaView(self.db, activo, participantes)
-        embed = _embed_resumen_evento(activo, len(participantes))
-
-        await interaction.response.send_message(embed=embed, view=view)
+        view = InfoPaginadaView(self.db, activo, participantes, owner_id=interaction.user.id)
+        view.message = await interaction.followup.send(
+            embed=_embed_resumen_evento(activo, len(participantes)), view=view, wait=True
+        )
 
     # ── /reto historial ──
 
@@ -482,7 +501,7 @@ class Historial(commands.Cog):
         # Mini resumen de eventos
         resumen_lineas = []
         for i, e in enumerate(eventos[:10], 1):
-            fecha = e["fecha_cierre"][:10] if e["fecha_cierre"] else "N/A"
+            fecha = fecha_corta(e["fecha_cierre"])
             resumen_lineas.append(f"`{i}.`  **{e['nombre'][:80]}**  •  📅 {fecha}")
 
         embed = discord.Embed(
@@ -503,53 +522,29 @@ class Historial(commands.Cog):
 
         view = HistorialView(eventos, self.db)
         await interaction.response.send_message(embed=embed, view=view)
+        view.message = await interaction.original_response()
 
 
     # ── /help ──
 
     @app_commands.command(name="help", description="Muestra el manual de usuario completo de Ribby")
-    @app_commands.guilds(*config.GUILD_IDS)
+    @en_servidores_configurados
     async def help_command(self, interaction: discord.Interaction):
-        try:
-            with MANUAL_USUARIO_PATH.open("r", encoding="utf-8") as f:
-                contenido = f.read()
-        except FileNotFoundError:
-            return await interaction.response.send_message(
-                "❌ No se encontró el archivo `MANUAL_DE_USUARIO.md`.", ephemeral=True
-            )
-
-        # Separar el manual por las etiquetas horizontales ---
-        secciones = [s.strip() for s in contenido.split("\n---")]
-        
-        embeds = []
-        for i, seccion in enumerate(secciones):
-            if not seccion:
-                continue
-            
-            embed = discord.Embed(
-                description=seccion[:4096],  # Límite de discord
-                color=config.COLOR_PRINCIPAL,
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.set_author(name="Ribby 🎀 • Manual de Usuario", icon_url=config.BOT_ICON_URL or None)
-            embed.set_footer(text=f"Página {i + 1} de {len(secciones)}  •  COMARCALIT")
-            embeds.append(embed)
-
-        if not embeds:
-            return await interaction.response.send_message("❌ El manual está vacío.", ephemeral=True)
-
-        view = ManualPaginadoView(embeds)
-        await interaction.response.send_message(embed=embeds[0], view=view)
-
+        await self._enviar_manual(
+            interaction,
+            MANUAL_USUARIO_PATH,
+            autor="Ribby 🎀 • Manual de Usuario",
+            pie="COMARCALIT",
+            color=config.COLOR_PRINCIPAL,
+            privado=False,
+        )
 
     # ── /admin_help ──
 
     @app_commands.command(name="admin_help", description="Muestra el manual de administradores de Ribby (solo Staff)")
-    @app_commands.guilds(*config.GUILD_IDS)
+    @en_servidores_configurados
     async def admin_help_command(self, interaction: discord.Interaction):
-        # Verificar rol de admin
-        es_admin = any(role.name == config.ADMIN_ROLE_NAME for role in interaction.user.roles)
-        if not es_admin:
+        if not es_admin(interaction):
             embed = discord.Embed(
                 description="**⛔  Sin permisos**\n\nEste manual es clasificado y solo para líderes de La Comarca.",
                 color=config.COLOR_ERROR,
@@ -557,36 +552,45 @@ class Historial(commands.Cog):
             embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
+        # Siempre privado: el manual describe el sistema antifraude
+        await self._enviar_manual(
+            interaction,
+            MANUAL_ADMIN_PATH,
+            autor="🔒 Admin • Manual de Secretos",
+            pie="COMARCALIT (Confidencial)",
+            color=0x4B5563,
+            privado=True,
+        )
+
+    @staticmethod
+    async def _enviar_manual(
+        interaction: discord.Interaction,
+        ruta: Path,
+        autor: str,
+        pie: str,
+        color: int,
+        privado: bool,
+    ) -> None:
         try:
-            with MANUAL_ADMIN_PATH.open("r", encoding="utf-8") as f:
-                contenido = f.read()
+            contenido = ruta.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return await interaction.response.send_message(
-                "❌ No se encontró el archivo `MANUAL_ADMINISTRADORES.md`.", ephemeral=True
-            )
+            return await interaction.response.send_message(f"❌ No se encontró el archivo `{ruta.name}`.", ephemeral=True)
 
-        secciones = [s.strip() for s in contenido.split("\n---")]
-        
-        embeds = []
-        for i, seccion in enumerate(secciones):
-            if not seccion:
-                continue
-            
-            embed = discord.Embed(
-                description=seccion[:4096],
-                color=0x4B5563,  # Color más oscuro para admin
-                timestamp=datetime.now(timezone.utc)
-            )
-            embed.set_author(name="🔒 Admin • Manual de Secretos", icon_url=config.BOT_ICON_URL or None)
-            embed.set_footer(text=f"Página {i + 1} de {len(secciones)}  •  COMARCALIT (Confidencial)")
-            embeds.append(embed)
-
-        if not embeds:
+        # Separar el manual por las líneas horizontales ---
+        secciones = [sec.strip() for sec in contenido.split("\n---") if sec.strip()]
+        if not secciones:
             return await interaction.response.send_message("❌ El manual está vacío.", ephemeral=True)
 
+        embeds = []
+        for i, seccion in enumerate(secciones, 1):
+            embed = discord.Embed(description=seccion[:4096], color=color, timestamp=datetime.now(timezone.utc))
+            embed.set_author(name=autor, icon_url=config.BOT_ICON_URL or None)
+            embed.set_footer(text=f"Página {i} de {len(secciones)}  •  {pie}")
+            embeds.append(embed)
+
         view = ManualPaginadoView(embeds)
-        # Mostrarlo públicamente en el canal temporalmente, como solicitó el usuario
-        await interaction.response.send_message(embed=embeds[0], view=view)
+        await interaction.response.send_message(embed=embeds[0], view=view, ephemeral=privado)
+        view.message = await interaction.original_response()
 
 
 async def setup(bot: commands.Bot):

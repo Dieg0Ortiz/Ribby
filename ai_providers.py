@@ -1,192 +1,220 @@
+"""
+ai_providers.py — Proveedores de IA con respaldo en cadena.
+
+Orden: Claude → Gemini (rota entre varias llaves) → Groq → OpenRouter.
+Solo se usan los que tengan su API key configurada.
+Todos reciben el mismo formato: un system prompt y un historial
+[{"role": "user" | "ribby", "content": str}, ...].
+"""
+
+from __future__ import annotations
+
 import logging
-import random
+
 import aiohttp
-import google.generativeai as genai
+import anthropic
+from google import genai
+from google.genai import types
 
 log = logging.getLogger("bot-literario.ai_providers")
 
+# Límite de salida común. Discord admite 2000 caracteres por mensaje;
+# ~500 tokens deja margen sin cortar las respuestas a media frase.
+MAX_TOKENS_SALIDA = 500
+TIMEOUT_HTTP = aiohttp.ClientTimeout(total=30)
+
+
 class AIProvider:
     """Clase base para todos los proveedores de IA."""
+
+    nombre = "AIProvider"
+
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError
+
+
+def _es_error_de_cuota(e: Exception) -> bool:
+    texto = str(e).lower()
+    codigo = getattr(e, "code", None)
+    return codigo == 429 or "429" in texto or "quota" in texto or "rate limit" in texto or "resource_exhausted" in texto
+
+
+class ClaudeProvider(AIProvider):
+    """Claude (Anthropic) — por defecto Claude Haiku 5.5, el modelo más barato y rápido."""
+
+    nombre = "Claude"
+
+    def __init__(self, api_key: str, model_name: str):
+        self.model_name = model_name
+        # Un solo reintento automático (429/5xx/529) y timeout corto: si Claude
+        # no responde rápido, es mejor pasar al siguiente proveedor.
+        self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=30.0, max_retries=1)
+
+    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+        messages = [
+            {"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
+            for m in chat_history
+        ]
+        if not messages:
+            raise ValueError("El historial no puede estar vacío.")
+
+        try:
+            resp = await self._client.messages.create(
+                model=self.model_name,
+                max_tokens=MAX_TOKENS_SALIDA,
+                system=system_prompt,
+                messages=messages,
+                # Sin razonamiento interno y esfuerzo bajo: respuestas cortas de chat,
+                # los tokens se gastan solo en el texto que ve el usuario.
+                thinking={"type": "disabled"},
+                output_config={"effort": "low"},
+            )
+        except anthropic.AuthenticationError as e:
+            raise RuntimeError("API key de Claude inválida (revisa ANTHROPIC_API_KEY)") from e
+        except anthropic.RateLimitError as e:
+            raise RuntimeError("Claude: límite de uso alcanzado (429)") from e
+        except anthropic.OverloadedError as e:
+            raise RuntimeError("Claude: servicio saturado (529)") from e
+        except anthropic.APIStatusError as e:
+            raise RuntimeError(f"Claude error {e.status_code}: {e.message}") from e
+        except anthropic.APIConnectionError as e:
+            raise RuntimeError(f"Claude: error de conexión ({e})") from e
+
+        if resp.stop_reason == "refusal":
+            raise RuntimeError("Claude rechazó responder a este mensaje")
+
+        texto = "".join(b.text for b in resp.content if b.type == "text").strip()
+        if not texto:
+            raise RuntimeError("Respuesta vacía de Claude")
+        return texto
+
 
 class GeminiProvider(AIProvider):
-    def __init__(self, api_keys: list[str]):
+    nombre = "Gemini"
+
+    def __init__(self, api_keys: list[str], model_name: str):
         self.api_keys = api_keys
+        self.model_name = model_name
         self.current_key_idx = 0
-        self.model_name = 'gemini-2.5-flash'
-        self._configure_current_key()
-
-    def _configure_current_key(self):
-        if self.api_keys:
-            key = self.api_keys[self.current_key_idx]
-            genai.configure(api_key=key)
-            self.model = genai.GenerativeModel(self.model_name)
-            log.info(f"Usando Gemini API Key índice {self.current_key_idx} (Termina en ...{key[-4:]})")
-
-    def _next_key(self) -> bool:
-        """Rota a la siguiente llave. Devuelve True si rotó con éxito, False si ya probó todas."""
-        if not self.api_keys:
-            return False
-        
-        self.current_key_idx += 1
-        if self.current_key_idx >= len(self.api_keys):
-            self.current_key_idx = 0
-            return False # Ya dimos la vuelta completa
-            
-        self._configure_current_key()
-        return True
+        self._clientes = [genai.Client(api_key=k) for k in api_keys]
 
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
         if not self.api_keys:
-            raise Exception("No hay llaves de Gemini configuradas.")
+            raise RuntimeError("No hay llaves de Gemini configuradas.")
 
-        # Construir el formato nativo de historial para Gemini
-        contents = []
-        for msg in chat_history:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [msg["content"]]})
-            
-        # Inyectar el system prompt en el primer mensaje del usuario para simularlo
-        if contents and contents[0]["role"] == "user":
-            contents[0]["parts"][0] = f"{system_prompt}\n\n---\n\n{contents[0]['parts'][0]}"
-        else:
-            # Fallback por si acaso
-            contents.insert(0, {"role": "user", "parts": [f"{system_prompt}\n\n---\n\nInicia la charla."]})
-            contents.insert(1, {"role": "model", "parts": ["Entendido."]})
+        contents = [
+            {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+            for m in chat_history
+        ]
+        if not contents:
+            raise ValueError("El historial no puede estar vacío.")
 
-        # Intentar con la llave actual, si da 429, rotar
-        keys_tried = 0
-        while keys_tried < len(self.api_keys):
+        cfg = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=MAX_TOKENS_SALIDA,
+            temperature=0.8,
+            # Sin "thinking": respuestas cortas y rápidas, y no consume el límite de salida
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+
+        # Probar TODAS las llaves empezando por la actual, dando la vuelta completa
+        n = len(self.api_keys)
+        for intento in range(n):
+            idx = (self.current_key_idx + intento) % n
             try:
-                response = await self.model.generate_content_async(contents)
-                if response.text:
-                    return response.text
-                raise Exception("Respuesta vacía de Gemini")
-            except Exception as e:
-                error_msg = str(e)
-                log.warning(f"Error con Gemini (Key {self.current_key_idx}): {error_msg}")
-                # Si es un error de cuota o rate limit
-                if "429" in error_msg or "Quota" in error_msg or "rate limit" in error_msg.lower():
-                    log.info("Cuota excedida en la llave actual. Rotando a la siguiente...")
-                    keys_tried += 1
-                    if not self._next_key():
-                        break # Ya probamos todas
-                else:
-                    raise # Otro tipo de error (ej. bloqueo de seguridad)
-        
-        raise Exception("Todas las llaves de Gemini fallaron o excedieron su cuota.")
+                resp = await self._clientes[idx].aio.models.generate_content(
+                    model=self.model_name, contents=contents, config=cfg
+                )
+                texto = (resp.text or "").strip()
+                if not texto:
+                    raise RuntimeError("Respuesta vacía de Gemini")
+                self.current_key_idx = idx  # Recordar la última llave que funcionó
+                return texto
+            except Exception as e:  # noqa: BLE001
+                if _es_error_de_cuota(e):
+                    log.info(f"Cuota excedida en la llave Gemini #{idx} (…{self.api_keys[idx][-4:]}); probando la siguiente")
+                    continue
+                raise  # Otro error (bloqueo de seguridad, modelo inexistente…)
 
-class GroqProvider(AIProvider):
-    def __init__(self, api_key: str):
+        raise RuntimeError("Todas las llaves de Gemini excedieron su cuota.")
+
+
+class OpenAICompatibleProvider(AIProvider):
+    """Proveedor para APIs con formato OpenAI /chat/completions (Groq, OpenRouter)."""
+
+    def __init__(self, nombre: str, api_key: str, model_name: str, url: str, extra_headers: dict | None = None):
+        self.nombre = nombre
         self.api_key = api_key
-        # Llama 3.3 70B es el modelo gratuito más potente en Groq actualmente
-        self.model_name = "llama-3.3-70b-versatile"
-        self.url = "https://api.groq.com/openai/v1/chat/completions"
+        self.model_name = model_name
+        self.url = url
+        self.extra_headers = extra_headers or {}
 
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
         if not self.api_key:
-            raise Exception("No hay llave de Groq configurada.")
+            raise RuntimeError(f"No hay llave de {self.nombre} configurada.")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        # Construir array de mensajes estilo OpenAI
         messages = [{"role": "system", "content": system_prompt}]
-        for msg in chat_history:
-            role = "user" if msg["role"] == "user" else "assistant"
-            messages.append({"role": role, "content": msg["content"]})
-        
+        messages += [
+            {"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
+            for m in chat_history
+        ]
         payload = {
             "model": self.model_name,
             "messages": messages,
-            "max_tokens": 150,
-            "temperature": 0.7
+            "max_tokens": MAX_TOKENS_SALIDA,
+            "temperature": 0.7,
         }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", **self.extra_headers}
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=TIMEOUT_HTTP) as session:
             async with session.post(self.url, headers=headers, json=payload) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    raise Exception(f"Groq error {resp.status}: {text}")
+                    texto = await resp.text()
+                    raise RuntimeError(f"{self.nombre} error {resp.status}: {texto[:300]}")
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"]
 
-class OpenRouterProvider(AIProvider):
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        # Modelo gratuito de OpenRouter
-        self.model_name = "meta-llama/llama-3.1-8b-instruct:free"
-        self.url = "https://openrouter.ai/api/v1/chat/completions"
+        contenido = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        if not contenido.strip():
+            raise RuntimeError(f"Respuesta vacía de {self.nombre}")
+        return contenido.strip()
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
-        if not self.api_key:
-            raise Exception("No hay llave de OpenRouter configurada.")
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/ComarcaLit/Ribby",
-            "X-Title": "Ribby Bot"
-        }
-        
-        # Construir array de mensajes estilo OpenAI
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in chat_history:
-            role = "user" if msg["role"] == "user" else "assistant"
-            messages.append({"role": role, "content": msg["content"]})
-        
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": 150,
-            "temperature": 0.7
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.url, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise Exception(f"OpenRouter error {resp.status}: {text}")
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"]
 
 class ProviderManager:
-    """Maneja la lógica de fallback entre proveedores."""
+    """Prueba los proveedores en orden hasta que uno responda."""
+
     def __init__(self, config):
         self.providers: list[AIProvider] = []
-        
-        # 1. Añadir Gemini (tiene soporte nativo de rotación)
+
+        # Claude va primero; los demás solo se usan como respaldo si están configurados
+        if config.ANTHROPIC_API_KEY:
+            self.providers.append(ClaudeProvider(config.ANTHROPIC_API_KEY, config.CLAUDE_MODEL))
         if config.GEMINI_API_KEYS:
-            self.providers.append(GeminiProvider(config.GEMINI_API_KEYS))
-            
-        # 2. Añadir Groq como primer respaldo (es más rápido y estable que OR gratuito)
+            self.providers.append(GeminiProvider(config.GEMINI_API_KEYS, config.GEMINI_MODEL))
         if config.GROQ_API_KEY:
-            self.providers.append(GroqProvider(config.GROQ_API_KEY))
-            
-        # 3. Añadir OpenRouter como segundo respaldo
+            self.providers.append(OpenAICompatibleProvider(
+                "Groq", config.GROQ_API_KEY, config.GROQ_MODEL,
+                "https://api.groq.com/openai/v1/chat/completions",
+            ))
         if config.OPENROUTER_API_KEY:
-            self.providers.append(OpenRouterProvider(config.OPENROUTER_API_KEY))
-            
-        log.info(f"ProviderManager inicializado con {len(self.providers)} proveedores de IA.")
+            self.providers.append(OpenAICompatibleProvider(
+                "OpenRouter", config.OPENROUTER_API_KEY, config.OPENROUTER_MODEL,
+                "https://openrouter.ai/api/v1/chat/completions",
+                {"HTTP-Referer": "https://github.com/ComarcaLit/Ribby", "X-Title": "Ribby Bot"},
+            ))
+
+        log.info(f"ProviderManager inicializado con {len(self.providers)} proveedor(es) de IA.")
 
     async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
         if not self.providers:
-            raise Exception("No hay ningún proveedor de IA configurado.")
-            
-        for i, provider in enumerate(self.providers):
+            raise RuntimeError("No hay ningún proveedor de IA configurado.")
+
+        ultimo_error: Exception | None = None
+        for provider in self.providers:
             try:
-                provider_name = provider.__class__.__name__
-                log.info(f"Intentando generar respuesta con {provider_name}...")
-                response = await provider.generate(system_prompt, chat_history)
-                return response
-            except Exception as e:
-                log.warning(f"Fallo en {provider.__class__.__name__}: {e}")
-                if i < len(self.providers) - 1:
-                    log.info(f"Saltando al siguiente proveedor de IA...")
-                else:
-                    raise Exception("TODOS los proveedores de IA fallaron.")
-                    
-        raise Exception("Flujo inesperado en ProviderManager.")
+                log.debug(f"Generando respuesta con {provider.nombre}...")
+                return await provider.generate(system_prompt, chat_history)
+            except Exception as e:  # noqa: BLE001
+                ultimo_error = e
+                log.warning(f"Fallo en {provider.nombre}: {e}")
+
+        raise RuntimeError(f"Todos los proveedores de IA fallaron (último error: {ultimo_error})")

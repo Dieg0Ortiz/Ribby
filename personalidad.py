@@ -11,6 +11,7 @@ que se usan en todos los cogs para darle vida al bot.
 """
 
 import random
+import re
 
 # ─────────────────────────── Frases según contexto ───────────────────────────
 
@@ -103,7 +104,13 @@ PROTECTORA = [
 # Palabras que activan el modo protector
 PALABRAS_NEGATIVAS = {
     "feo", "feos", "malo", "malos", "basura", "horrible", "horribles",
-    "aburrido", "aburridos", "odio", "asqueroso", "horrible",
+    "aburrido", "aburridos", "odio", "asqueroso",
+}
+
+# Palabras que indican que se habla de libros/historias
+PALABRAS_LIBRO = {
+    "libro", "libros", "historia", "historias", "reto", "retos",
+    "pdf", "pdfs", "cuento", "cuentos", "biblioteca",
 }
 
 # Tips/frases que van en los footers
@@ -134,10 +141,10 @@ def tip_aleatorio() -> str:
 
 def es_mencion_negativa(texto: str) -> bool:
     """Detecta si el texto contiene palabras negativas sobre libros."""
-    palabras = texto.lower().split()
-    tiene_negativa = any(p in PALABRAS_NEGATIVAS for p in palabras)
-    tiene_libro = any(p in texto.lower() for p in ["libro", "historia", "reto", "pdf", "cuento"])
-    return tiene_negativa and tiene_libro
+    # \w+ separa también la puntuación ("feo," → "feo") y compara palabras
+    # completas, así "secreto" ya no cuenta como "reto".
+    palabras = set(re.findall(r"\w+", texto.lower()))
+    return bool(palabras & PALABRAS_NEGATIVAS) and bool(palabras & PALABRAS_LIBRO)
 
 
 def descripcion_biblioteca(libros: int) -> str:

@@ -23,7 +23,7 @@ El bot los deja votar y les envía un mensaje de "✅ ¡Voto Registrado!". Ellos
 ## 🔄 2. Flujo del Evento (Resumen de Admin)
 1. `/evento crear`: Abre inscripciones.
 2. `/evento iniciar_narracion` / `/evento cerrar_narracion`: Abre/Cierra sesiones de voz. El bot rastrea los minutos automáticamente de fondo. Se pueden hacer múltiples sesiones.
-3. `/evento iniciar_votacion`: Inicia el engaño. Todos pueden votar, pero el bot ya decidió quiénes son válidos y quiénes serán anulados en secreto.
+3. `/evento iniciar_votacion`: Inicia el engaño. Todos pueden votar, pero el bot ya decidió quiénes son válidos y quiénes serán anulados en secreto. Las descargas cuentan solo si se hicieron **antes** de este comando.
 4. `/evento cerrar`: Finaliza todo, anuncia al ganador y genera el reporte de nulos.
 
 ---
@@ -31,7 +31,9 @@ El bot los deja votar y les envía un mensaje de "✅ ¡Voto Registrado!". Ellos
 ## 📋 3. Comandos Exclusivos de Staff
 
 - `/evento crear [nombre]`: Inicia el evento.
-- `/evento configurar [canal_voz] [canal_envio]`: Indispensable para que el bot sepa qué canal de voz debe espiar para contar los minutos de asistencia.
+- `/evento configurar [canal_voz] [canal_envio] [canal_respaldo]`: Indispensable para que el bot sepa qué canal de voz debe espiar para contar los minutos de asistencia. El canal de respaldo (opcional y privado) guarda una copia de cada archivo.
+- `/evento configurar_votos [cantidad]`: Cuántos votos (1–10) puede emitir cada persona por historias distintas.
+- `/admin_help`: Muestra este manual. Siempre responde en privado (solo lo ves tú).
 - `/evento iniciar_narracion`: Inicia el cronómetro en el canal de voz configurado.
 - `/evento cerrar_narracion`: Detiene el cronómetro del día.
 - `/evento iniciar_votacion`: Filtra a los habilitados (en secreto) y abre las urnas.
@@ -39,3 +41,36 @@ El bot los deja votar y les envía un mensaje de "✅ ¡Voto Registrado!". Ellos
 
 > [!WARNING]
 > Recuerda no compartir este documento ni capturas del mismo en canales públicos, o la magia del sistema antifraude se perderá.
+
+---
+
+## 💞 4. Comandos de Staff de la Vida Social de Ribby
+- `/ribby canal [canal]`: **Configúralo primero.** Es el canal donde Ribby felicita cumpleaños, celebra aniversarios, anuncia eventos de temporada y saluda por iniciativa propia. Sin canal, nada de eso se publica.
+- `/ribby reiniciar [usuario]`: borra la relación de alguien con Ribby (corazones, pareja, etc.).
+- `/biblioteca eliminar` y `/biblioteca sincronizar`: gestión de la biblioteca.
+
+Límites de la iniciativa de Ribby (para que nunca sea spam): como mucho 1 mensaje cada 6 horas en todo el servidor, solo entre las 11:00 y las 21:00 (hora de México), a cada persona como mucho cada 4 días, y solo a mejores amigos o a su pareja. Cada usuario puede desactivarlo con `/ribby avisos`.
+
+---
+
+## 🧪 5. Modo de Pruebas
+Para probar cualquier función sin tocar los datos reales.
+
+- `/prueba activar`: desde ese momento, **todo lo que hagas tú** (comandos, botones, hablar con Ribby, canal de voz) se guarda en una base de datos de pruebas aparte. El resto del servidor sigue usando los datos reales aunque estéis en el mismo canal. Ribby marca con 🧪 sus respuestas mientras estés en pruebas.
+- `/prueba desactivar` · `/prueba estado`
+- `/prueba sembrar`: copia la biblioteca real a la de pruebas (empieza vacía).
+- `/prueba reiniciar`: borra todos los datos de prueba.
+
+**Atajos (solo en modo de pruebas):**
+- `/prueba nivel`: salta a cualquier nivel con Ribby (amigo, mejor amigo, algo más, enamorada, pareja).
+- `/prueba diario`: reinicia los límites diarios (regalo, cita, quiz, corazones, declaración, misión).
+- `/prueba tiempo [días]`: viaja al futuro (enfriamiento del interés, inactividad, misión de lectura ya "leída").
+- `/prueba evento`: fuerza San Valentín, Día del Libro, Halloween o Navidad solo para ti.
+- `/prueba celebrar`: lanza ya un cumpleaños, un aniversario o el anuncio de un evento.
+- `/prueba iniciativa`: Ribby te escribe por su cuenta ahora mismo.
+- `/prueba capitulo_nuevo`: simula que una historia que sigues publicó un capítulo.
+
+Para probar retos completos en solitario: crea el evento y registra a otra persona con `/participante_registrar usuario:@alguien` (sus datos también irán a pruebas porque el comando lo lanzas tú) y vota por su historia.
+
+**Nota sobre Tainy (creador de Ribby):** fuera de pruebas, Ribby le trata como a su padre (cariño de familia, corazones al máximo, nunca romance). En modo de pruebas le trata como a un usuario normal para que pueda probar todas las rutas.
+

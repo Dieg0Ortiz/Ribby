@@ -1,5 +1,6 @@
-discord.py>=2.3.2
-asyncpg>=0.29.0
-python-dotenv>=1.0.0
-google-generativeai>=0.5.2
-aiohttp>=3.9.0
+discord.py>=2.4,<3
+asyncpg>=0.29,<1
+python-dotenv>=1.0,<2
+google-genai>=1.0,<2
+anthropic>=2.12,<3
+aiohttp>=3.9,<4

@@ -1,82 +1,422 @@
 """
 database.py — Lógica de base de datos PostgreSQL (Supabase) para Ribby.
 
-Usa asyncpg para operaciones asíncronas de altísimo rendimiento.
+Usa asyncpg para operaciones asíncronas. El esquema de referencia está en
+schema.sql; al arrancar, `init_db` aplica los ajustes mínimos que el código
+necesita (columnas y constraints añadidas en versiones posteriores).
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
-from typing import Dict, Optional, Any
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import asyncpg
-from datetime import datetime, timezone
 
 import config
 
 log = logging.getLogger("bot-literario.database")
 
+
+# ─────────────────────────── Modo de pruebas: enrutado de consultas ───────────────────────────
+#
+# Las tablas del bot existen dos veces: en el esquema "public" (datos reales) y
+# en "pruebas" (copia vacía con la misma estructura). Cuando quien provoca una
+# consulta está en modo de pruebas (comun.en_prueba), se reescribe el SQL para
+# apuntar a "pruebas.<tabla>". Se reescribe el texto en vez de usar search_path
+# porque el pooler de transacciones de Supabase no conserva el search_path.
+
+ESQUEMA_PRUEBAS = "pruebas"
+TABLAS_BOT = [
+    "eventos", "narraciones", "participantes", "asistencia_voz", "votos", "habilitados_voto",
+    "descargas_documentos", "documentos_participantes", "ribby_memoria", "biblioteca_historias",
+    "biblioteca_etiquetas", "autores_wattpad", "afinidad_usuarios", "ribby_config", "cumpleanos", "resenas",
+    "misiones_lectura", "logros_usuarios", "ribby_capitulos", "seguimientos",
+]
+_RE_TABLAS = re.compile(
+    r"\b(FROM|JOIN|INTO|UPDATE)(\s+)(" + "|".join(sorted(TABLAS_BOT, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def sql_para_pruebas(sql: str) -> str:
+    """Redirige las tablas del bot al esquema de pruebas."""
+    return _RE_TABLAS.sub(lambda m: f"{m.group(1)}{m.group(2)}{ESQUEMA_PRUEBAS}.{m.group(3)}", sql)
+
+
+class _ConexionEnrutada:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _sql(self, sql: str) -> str:
+        from comun import en_prueba
+        return sql_para_pruebas(sql) if en_prueba() else sql
+
+    async def execute(self, sql: str, *args, **kw):
+        return await self._conn.execute(self._sql(sql), *args, **kw)
+
+    async def fetch(self, sql: str, *args, **kw):
+        return await self._conn.fetch(self._sql(sql), *args, **kw)
+
+    async def fetchrow(self, sql: str, *args, **kw):
+        return await self._conn.fetchrow(self._sql(sql), *args, **kw)
+
+    async def fetchval(self, sql: str, *args, **kw):
+        return await self._conn.fetchval(self._sql(sql), *args, **kw)
+
+    def transaction(self, *args, **kw):
+        return self._conn.transaction(*args, **kw)
+
+
+class PoolEnrutado:
+    """Envuelve el pool real; mismo uso (`async with pool.acquire() as conn`)."""
+
+    def __init__(self, pool: asyncpg.Pool):
+        self.real = pool
+
+    @contextlib.asynccontextmanager
+    async def acquire(self):
+        async with self.real.acquire() as conn:
+            yield _ConexionEnrutada(conn)
+
+    async def close(self) -> None:
+        await self.real.close()
+
+
+async def preparar_esquema_pruebas(pool: Any, reiniciar: bool = False) -> None:
+    """Crea (o recrea vacío) el esquema de pruebas copiando la estructura de las tablas reales."""
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        if reiniciar:
+            await conn.execute(f"DROP SCHEMA IF EXISTS {ESQUEMA_PRUEBAS} CASCADE")
+        await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {ESQUEMA_PRUEBAS}")
+        for tabla in TABLAS_BOT:
+            if not await conn.fetchval("SELECT to_regclass($1)", f"public.{tabla}"):
+                continue
+            await conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {ESQUEMA_PRUEBAS}.{tabla} (LIKE public.{tabla} INCLUDING ALL)"
+            )
+            # Columnas añadidas a la tabla real después de crear la copia de pruebas
+            faltan = await conn.fetch(
+                """
+                SELECT a.attname AS columna, format_type(a.atttypid, a.atttypmod) AS tipo
+                FROM pg_attribute a
+                WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_attribute b
+                      WHERE b.attrelid = to_regclass($2) AND b.attname = a.attname AND NOT b.attisdropped
+                  )
+                ORDER BY a.attnum
+                """,
+                f"public.{tabla}", f"{ESQUEMA_PRUEBAS}.{tabla}",
+            )
+            for col in faltan:
+                await conn.execute(
+                    f'ALTER TABLE {ESQUEMA_PRUEBAS}.{tabla} ADD COLUMN IF NOT EXISTS "{col["columna"]}" {col["tipo"]}'
+                )
+
+
+async def sembrar_biblioteca_pruebas(pool: Any) -> int:
+    """Copia la biblioteca real (historias, etiquetas, autores) al esquema de pruebas."""
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+
+        async def columnas(tabla: str, alias: str = "") -> str:
+            filas = await conn.fetch(
+                "SELECT attname FROM pg_attribute WHERE attrelid = to_regclass($1) AND attnum > 0 "
+                "AND NOT attisdropped ORDER BY attnum",
+                f"public.{tabla}",
+            )
+            return ", ".join(f'{alias}"{f["attname"]}"' for f in filas)
+
+        async with conn.transaction():
+            for tabla in ("biblioteca_etiquetas", "biblioteca_historias", "autores_wattpad"):
+                await conn.execute(f"DELETE FROM {ESQUEMA_PRUEBAS}.{tabla}")
+            cols = await columnas("biblioteca_historias")
+            # Las historias de retos apuntan a participantes reales que no existen en pruebas
+            await conn.execute(
+                f"INSERT INTO {ESQUEMA_PRUEBAS}.biblioteca_historias ({cols}) "
+                f"SELECT {cols} FROM public.biblioteca_historias WHERE participante_id IS NULL"
+            )
+            cols = await columnas("biblioteca_etiquetas")
+            await conn.execute(
+                f"INSERT INTO {ESQUEMA_PRUEBAS}.biblioteca_etiquetas ({cols}) "
+                f"SELECT {await columnas('biblioteca_etiquetas', 'e.')} FROM public.biblioteca_etiquetas e "
+                f"JOIN {ESQUEMA_PRUEBAS}.biblioteca_historias h ON h.id = e.historia_id"
+            )
+            cols = await columnas("autores_wattpad")
+            await conn.execute(
+                f"INSERT INTO {ESQUEMA_PRUEBAS}.autores_wattpad ({cols}) SELECT {cols} FROM public.autores_wattpad"
+            )
+            return await conn.fetchval(f"SELECT COUNT(*) FROM {ESQUEMA_PRUEBAS}.biblioteca_historias") or 0
+
+
 # ─────────────────────────── Inicialización ───────────────────────────
 
-async def init_db() -> asyncpg.Pool:
-    """Crea y retorna un pool de conexiones a PostgreSQL."""
+async def init_db() -> PoolEnrutado:
+    """Crea el pool de conexiones a PostgreSQL (envuelto para el modo de pruebas)."""
     if not config.DATABASE_URL:
-        log.warning("DATABASE_URL no está configurada. El bot podría no funcionar correctamente.")
-        # Retornamos un objeto dummy o lanzamos error. Mejor intentar conectar si existe.
-        pass
+        raise RuntimeError("DATABASE_URL no está configurada; Ribby no puede arrancar sin base de datos.")
 
     log.info("Conectando a PostgreSQL (Supabase)...")
+    # statement_cache_size=0 es necesario para el "Transaction Pooler" de Supabase
+    pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
+    await _asegurar_esquema(pool)
     try:
-        # statement_cache_size=0 es necesario para que funcione con el "Transaction Pooler" de Supabase
-        pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
-        await _asegurar_esquema_eventos(pool)
-        return pool
-    except Exception as e:
-        log.error(f"Error conectando a la base de datos: {e}")
-        raise
+        await preparar_esquema_pruebas(pool)
+    except Exception as e:  # noqa: BLE001 — el bot funciona aunque no haya esquema de pruebas
+        log.warning(f"No se pudo preparar el esquema de pruebas: {e}")
+    return PoolEnrutado(pool)
+
+
+# Cada paso es independiente: si uno falla (p. ej. hay datos duplicados que
+# impiden crear un UNIQUE) se registra y el bot sigue arrancando.
+_PASOS_ESQUEMA: list[tuple[str, str]] = [
+    (
+        "columna eventos.votos_max_por_usuario",
+        "ALTER TABLE eventos ADD COLUMN IF NOT EXISTS votos_max_por_usuario INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        "quitar UNIQUE de 1 voto por usuario",
+        "ALTER TABLE votos DROP CONSTRAINT IF EXISTS votos_evento_votante_key",
+    ),
+    (
+        "quitar UNIQUE de 1 voto por usuario (nombre alternativo)",
+        "ALTER TABLE votos DROP CONSTRAINT IF EXISTS votos_evento_id_votante_discord_id_key",
+    ),
+    (
+        "UNIQUE (evento, votante, participante) en votos",
+        "ALTER TABLE votos ADD CONSTRAINT votos_evento_votante_participante_key "
+        "UNIQUE (evento_id, votante_discord_id, participante_id)",
+    ),
+    # ── Biblioteca de recomendaciones ──
+    (
+        "tabla biblioteca_historias",
+        """
+        CREATE TABLE IF NOT EXISTS biblioteca_historias (
+            id                SERIAL PRIMARY KEY,
+            fuente            TEXT NOT NULL,              -- 'wattpad' | 'reto'
+            wattpad_id        TEXT UNIQUE,
+            participante_id   INTEGER UNIQUE REFERENCES participantes(id) ON DELETE SET NULL,
+            titulo            TEXT NOT NULL,
+            autor_nombre      TEXT,
+            autor_wattpad     TEXT,
+            autor_discord_id  TEXT,
+            descripcion       TEXT,
+            descripcion_fuente TEXT,                      -- 'wattpad' | 'autor' | 'usuario'
+            url               TEXT,
+            portada_url       TEXT,
+            lecturas          INTEGER,
+            votos             INTEGER,
+            partes            INTEGER,
+            completada        BOOLEAN,
+            madura            BOOLEAN NOT NULL DEFAULT FALSE,
+            agregada_por      TEXT,
+            fecha_alta        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            fecha_sync        TIMESTAMPTZ
+        )
+        """,
+    ),
+    (
+        "tabla biblioteca_etiquetas",
+        """
+        CREATE TABLE IF NOT EXISTS biblioteca_etiquetas (
+            historia_id   INTEGER NOT NULL REFERENCES biblioteca_historias(id) ON DELETE CASCADE,
+            valor         TEXT NOT NULL,                  -- en minúsculas
+            fuente        TEXT NOT NULL,                  -- 'wattpad' | 'autor' | 'usuario'
+            aportado_por  TEXT,
+            fecha         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (historia_id, valor)
+        )
+        """,
+    ),
+    (
+        "tabla autores_wattpad",
+        """
+        CREATE TABLE IF NOT EXISTS autores_wattpad (
+            wattpad_username  TEXT PRIMARY KEY,           -- en minúsculas
+            discord_id        TEXT NOT NULL,
+            fecha             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    # RLS activado: la API pública de Supabase (anon key) no puede leerlas ni
+    # escribirlas. El bot se conecta como dueño de las tablas y no se ve afectado.
+    ("RLS biblioteca_historias", "ALTER TABLE biblioteca_historias ENABLE ROW LEVEL SECURITY"),
+    ("RLS biblioteca_etiquetas", "ALTER TABLE biblioteca_etiquetas ENABLE ROW LEVEL SECURITY"),
+    ("RLS autores_wattpad", "ALTER TABLE autores_wattpad ENABLE ROW LEVEL SECURITY"),
+    # ── Medidor de corazones (reutiliza afinidad_usuarios, que ya existía) ──
+    (
+        "tabla afinidad_usuarios",
+        """
+        CREATE TABLE IF NOT EXISTS afinidad_usuarios (
+            usuario_discord_id   TEXT PRIMARY KEY,
+            nombre_display       TEXT NOT NULL,
+            corazones            REAL DEFAULT 0.0,
+            nivel_relacion       TEXT DEFAULT 'desconocido',
+            es_pareja            BOOLEAN DEFAULT FALSE,
+            fecha_inicio_pareja  TEXT,
+            racha_dias           INTEGER DEFAULT 0,
+            ultima_interaccion   TEXT,
+            total_interacciones  INTEGER DEFAULT 0,
+            historial_eventos    TEXT DEFAULT '[]'
+        )
+        """,
+    ),
+    (
+        "columnas nuevas de afinidad_usuarios",
+        """
+        ALTER TABLE afinidad_usuarios
+            ADD COLUMN IF NOT EXISTS corazones_hoy      REAL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS dia_corazones      TEXT,
+            ADD COLUMN IF NOT EXISTS coqueteos          INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS fecha_maximo       TEXT,
+            ADD COLUMN IF NOT EXISTS ultimo_regalo      TEXT,
+            ADD COLUMN IF NOT EXISTS ultima_cita        TEXT,
+            ADD COLUMN IF NOT EXISTS ultima_declaracion TEXT,
+            ADD COLUMN IF NOT EXISTS dias_descontados   INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS citas_total        INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS regalos_total      INTEGER DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS quiz_aciertos      INTEGER DEFAULT 0
+        """,
+    ),
+    (
+        "tabla ribby_capitulos",
+        """
+        CREATE TABLE IF NOT EXISTS ribby_capitulos (
+            usuario_discord_id  TEXT NOT NULL,
+            capitulo            INTEGER NOT NULL,
+            eleccion            INTEGER NOT NULL,
+            fecha               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (usuario_discord_id, capitulo)
+        )
+        """,
+    ),
+    ("RLS ribby_capitulos", "ALTER TABLE ribby_capitulos ENABLE ROW LEVEL SECURITY"),
+    # ── Vida social de Ribby: configuración, cumpleaños, reseñas, misiones y logros ──
+    (
+        "tabla ribby_config",
+        """
+        CREATE TABLE IF NOT EXISTS ribby_config (
+            clave  TEXT PRIMARY KEY,
+            valor  TEXT,
+            fecha  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "tabla cumpleanos",
+        """
+        CREATE TABLE IF NOT EXISTS cumpleanos (
+            usuario_discord_id  TEXT PRIMARY KEY,
+            dia                 INTEGER NOT NULL CHECK (dia BETWEEN 1 AND 31),
+            mes                 INTEGER NOT NULL CHECK (mes BETWEEN 1 AND 12)
+        )
+        """,
+    ),
+    (
+        "tabla resenas",
+        """
+        CREATE TABLE IF NOT EXISTS resenas (
+            id                  SERIAL PRIMARY KEY,
+            historia_id         INTEGER NOT NULL REFERENCES biblioteca_historias(id) ON DELETE CASCADE,
+            usuario_discord_id  TEXT NOT NULL,
+            usuario_nombre      TEXT,
+            puntuacion          INTEGER NOT NULL CHECK (puntuacion BETWEEN 1 AND 5),
+            texto               TEXT NOT NULL,
+            fecha               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (historia_id, usuario_discord_id)
+        )
+        """,
+    ),
+    (
+        "tabla misiones_lectura",
+        """
+        CREATE TABLE IF NOT EXISTS misiones_lectura (
+            id                  SERIAL PRIMARY KEY,
+            usuario_discord_id  TEXT NOT NULL,
+            historia_id         INTEGER NOT NULL REFERENCES biblioteca_historias(id) ON DELETE CASCADE,
+            estado              TEXT NOT NULL DEFAULT 'activa',   -- activa | completada | abandonada
+            fecha_asignada      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            fecha_completada    TIMESTAMPTZ
+        )
+        """,
+    ),
+    (
+        "una misión activa por usuario",
+        "CREATE UNIQUE INDEX IF NOT EXISTS misiones_una_activa ON misiones_lectura (usuario_discord_id) WHERE estado = 'activa'",
+    ),
+    (
+        "tabla logros_usuarios",
+        """
+        CREATE TABLE IF NOT EXISTS logros_usuarios (
+            usuario_discord_id  TEXT NOT NULL,
+            logro               TEXT NOT NULL,
+            fecha               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (usuario_discord_id, logro)
+        )
+        """,
+    ),
+    ("RLS ribby_config", "ALTER TABLE ribby_config ENABLE ROW LEVEL SECURITY"),
+    ("RLS cumpleanos", "ALTER TABLE cumpleanos ENABLE ROW LEVEL SECURITY"),
+    ("RLS resenas", "ALTER TABLE resenas ENABLE ROW LEVEL SECURITY"),
+    ("RLS misiones_lectura", "ALTER TABLE misiones_lectura ENABLE ROW LEVEL SECURITY"),
+    ("RLS logros_usuarios", "ALTER TABLE logros_usuarios ENABLE ROW LEVEL SECURITY"),
+    (
+        "tabla seguimientos",
+        """
+        CREATE TABLE IF NOT EXISTS seguimientos (
+            usuario_discord_id  TEXT NOT NULL,
+            historia_id         INTEGER NOT NULL REFERENCES biblioteca_historias(id) ON DELETE CASCADE,
+            fecha               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (usuario_discord_id, historia_id)
+        )
+        """,
+    ),
+    ("RLS seguimientos", "ALTER TABLE seguimientos ENABLE ROW LEVEL SECURITY"),
+    (
+        "una sola pareja de Ribby",
+        "CREATE UNIQUE INDEX IF NOT EXISTS afinidad_una_sola_pareja ON afinidad_usuarios ((es_pareja)) WHERE es_pareja",
+    ),
+]
+
+
+async def _asegurar_esquema(pool: asyncpg.Pool) -> None:
+    """Aplica de forma idempotente los ajustes de esquema que espera el código."""
+    async with pool.acquire() as conn:
+        for descripcion, sql in _PASOS_ESQUEMA:
+            try:
+                await conn.execute(sql)
+            except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError):
+                pass  # Ya existe
+            except Exception as e:  # noqa: BLE001
+                if "already exists" in str(e).lower():
+                    continue
+                log.warning(f"No se pudo aplicar '{descripcion}': {e}")
 
 
 def _now() -> datetime:
-    """Retorna el timestamp UTC actual como objeto datetime."""
+    """Timestamp UTC actual."""
     return datetime.now(timezone.utc)
 
 
 def _now_iso() -> str:
-    """Retorna el timestamp UTC actual en formato ISO 8601 string."""
-    return datetime.now(timezone.utc).isoformat()
+    """Timestamp UTC actual en ISO 8601 (las columnas de fecha históricas son TEXT)."""
+    return _now().isoformat()
 
 
-async def _asegurar_esquema_eventos(pool: asyncpg.Pool) -> None:
-    """Aplica ajustes mínimos al esquema que el código espera al iniciar."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            ALTER TABLE eventos
-            ADD COLUMN IF NOT EXISTS votos_max_por_usuario INTEGER NOT NULL DEFAULT 1;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE votos
-            DROP CONSTRAINT IF EXISTS votos_evento_votante_key;
-            """
-        )
-        await conn.execute(
-            """
-            ALTER TABLE votos
-            DROP CONSTRAINT IF EXISTS votos_evento_id_votante_discord_id_key;
-            """
-        )
-        try:
-            await conn.execute(
-                """
-                ALTER TABLE votos
-                ADD CONSTRAINT votos_evento_votante_participante_key
-                UNIQUE (evento_id, votante_discord_id, participante_id);
-                """
-            )
-        except (asyncpg.DuplicateObjectError, asyncpg.DuplicateTableError):
-            pass
+def _parse_ts(valor: Any) -> datetime:
+    """Convierte un timestamp de la BD (TEXT ISO o timestamptz) a datetime con zona."""
+    dt = valor if isinstance(valor, datetime) else datetime.fromisoformat(str(valor))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _minutos_desde(inicio: Any, fin: datetime) -> float:
+    return max(0.0, (fin - _parse_ts(inicio)).total_seconds() / 60.0)
 
 
 # ─────────────────────────── Eventos ───────────────────────────
@@ -86,21 +426,18 @@ async def crear_evento(pool: asyncpg.Pool, nombre: str, votos_max: int = 1) -> i
     async with pool.acquire() as conn:
         return await conn.fetchval(
             "INSERT INTO eventos (nombre, fecha_creacion, votos_max_por_usuario) VALUES ($1, $2, $3) RETURNING id",
-            nombre, _now_iso(), votos_max
+            nombre, _now_iso(), votos_max,
         )
 
 
 async def obtener_evento_activo(pool: asyncpg.Pool) -> Optional[Dict[str, Any]]:
     """Retorna el evento que NO esté cerrado (el activo). Solo uno a la vez."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM eventos WHERE estado != 'cerrado' ORDER BY id DESC LIMIT 1"
-        )
+        row = await conn.fetchrow("SELECT * FROM eventos WHERE estado != 'cerrado' ORDER BY id DESC LIMIT 1")
         return dict(row) if row else None
 
 
 async def obtener_evento_por_id(pool: asyncpg.Pool, evento_id: int) -> Optional[Dict[str, Any]]:
-    """Obtiene información de un evento por ID."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM eventos WHERE id = $1", evento_id)
         return dict(row) if row else None
@@ -111,72 +448,104 @@ async def configurar_canales_evento(
     evento_id: int,
     voz_id: int,
     envio_id: int,
-    respaldo_id: int
+    respaldo_id: Optional[int],
 ) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE eventos SET canal_voz_id = $1, canal_envio_id = $2, canal_respaldo_id = $3 WHERE id = $4",
-            voz_id, envio_id, respaldo_id, evento_id
+            voz_id, envio_id, respaldo_id, evento_id,
         )
 
 
-async def actualizar_estado_evento(pool: asyncpg.Pool, evento_id: int, estado: str) -> None:
+async def cambiar_estado_evento(pool: asyncpg.Pool, evento_id: int, estado: str) -> None:
     async with pool.acquire() as conn:
-        query = "UPDATE eventos SET estado = $1"
-        args: list[Any] = [estado]
         if estado == "cerrado":
-            query += ", fecha_cierre = $2"
-            args.append(_now_iso())
-        
-        query += f" WHERE id = ${len(args) + 1}"
-        args.append(evento_id)
-        
-        await conn.execute(query, *args)
+            await conn.execute(
+                "UPDATE eventos SET estado = $1, fecha_cierre = $2 WHERE id = $3",
+                estado, _now_iso(), evento_id,
+            )
+        else:
+            await conn.execute("UPDATE eventos SET estado = $1 WHERE id = $2", estado, evento_id)
+
+
+async def obtener_ultimos_eventos(pool: asyncpg.Pool, limite: int = 25) -> list[Dict[str, Any]]:
+    """Eventos cerrados más recientes (25 = máximo de opciones de un menú de Discord)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM eventos WHERE estado = 'cerrado' ORDER BY id DESC LIMIT $1", limite
+        )
+        return [dict(r) for r in rows]
 
 
 # ─────────────────────────── Narración ───────────────────────────
 
-async def iniciar_narracion(pool: asyncpg.Pool, evento_id: int, sesion: int) -> int:
-    """Registra el inicio de una sesión de narración y retorna su ID."""
+async def crear_narracion(pool: asyncpg.Pool, evento_id: int) -> tuple[int, int]:
+    """Crea una nueva narración. Retorna (narracion_id, numero_sesion)."""
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
-            evento_id, sesion, _now_iso()
-        )
+        async with conn.transaction():
+            # Bloqueo por evento para que dos comandos simultáneos no obtengan el mismo número
+            await conn.execute("SELECT pg_advisory_xact_lock(1, $1::int)", evento_id)
+            sesion = await conn.fetchval(
+                "SELECT COALESCE(MAX(numero_sesion), 0) + 1 FROM narraciones WHERE evento_id = $1", evento_id
+            )
+            nid = await conn.fetchval(
+                "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
+                evento_id, sesion, _now_iso(),
+            )
+            return nid, sesion
 
 
 async def obtener_narracion_activa(pool: asyncpg.Pool, evento_id: int) -> Optional[Dict[str, Any]]:
-    """Obtiene la narración en curso (sin timestamp_fin) para el evento."""
+    """Narración en curso (sin timestamp_fin) del evento."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1",
-            evento_id
+            "SELECT * FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL "
+            "ORDER BY numero_sesion DESC LIMIT 1",
+            evento_id,
         )
         return dict(row) if row else None
 
 
-async def detener_narracion(pool: asyncpg.Pool, narracion_id: int) -> None:
-    """Cierra la narración actual calculando su duración en minutos."""
-    now_dt = _now()
-    now_iso = now_dt.isoformat()
+async def obtener_narraciones(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT timestamp_inicio, evento_id FROM narraciones WHERE id = $1", narracion_id)
-        if not row:
-            return
-            
-        t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
-        t_fin = now_dt
-        duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
-
-        await conn.execute(
-            "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
-            now_iso, duracion_min, narracion_id
+        rows = await conn.fetch(
+            "SELECT * FROM narraciones WHERE evento_id = $1 ORDER BY numero_sesion ASC", evento_id
         )
+        return [dict(r) for r in rows]
 
-        # Actualizar total en evento
+
+async def cerrar_narracion_activa(pool: asyncpg.Pool, evento_id: int) -> Optional[tuple[int, float, int]]:
+    """Cierra la narración activa. Retorna (narracion_id, duracion_min, numero_sesion) o None."""
+    now_dt = _now()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id, timestamp_inicio, numero_sesion FROM narraciones "
+                "WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1 FOR UPDATE",
+                evento_id,
+            )
+            if not row:
+                return None
+            duracion_min = _minutos_desde(row["timestamp_inicio"], now_dt)
+            await conn.execute(
+                "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
+                now_dt.isoformat(), duracion_min, row["id"],
+            )
+            await conn.execute(
+                "UPDATE eventos SET duracion_narracion_minutos = COALESCE(duracion_narracion_minutos, 0) + $1 "
+                "WHERE id = $2",
+                duracion_min, evento_id,
+            )
+            return row["id"], duracion_min, row["numero_sesion"]
+
+
+async def guardar_duracion_total_narraciones(pool: asyncpg.Pool, evento_id: int) -> None:
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COALESCE(SUM(duracion_minutos), 0) FROM narraciones WHERE evento_id = $1", evento_id
+        )
         await conn.execute(
-            "UPDATE eventos SET duracion_narracion_minutos = duracion_narracion_minutos + $1 WHERE id = $2",
-            duracion_min, row["evento_id"]
+            "UPDATE eventos SET duracion_narracion_minutos = $1 WHERE id = $2", float(val or 0), evento_id
         )
 
 
@@ -188,522 +557,331 @@ async def registrar_participante(
     discord_id: int,
     nombre: str,
     titulo: Optional[str] = None,
-    url_portada: Optional[str] = None,
-    url_pdf: Optional[str] = None
 ) -> int:
-    """Registra o actualiza un participante."""
-    discord_id_str = str(discord_id)
+    """
+    Registra a un participante o actualiza su nombre/título.
+
+    Al re-registrarse se CONSERVAN los archivos ya subidos (url_pdf/url_portada)
+    y la fecha de registro original.
+    """
     async with pool.acquire() as conn:
-        # PostgreSQL UPSERT logic
-        query = """
-            INSERT INTO participantes 
-                (evento_id, usuario_discord_id, usuario_nombre, titulo_historia, url_portada, url_pdf, fecha_registro)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (evento_id, usuario_discord_id) 
-            DO UPDATE SET 
-                usuario_nombre = EXCLUDED.usuario_nombre,
-                titulo_historia = EXCLUDED.titulo_historia,
-                url_portada = EXCLUDED.url_portada,
-                url_pdf = EXCLUDED.url_pdf,
-                fecha_registro = EXCLUDED.fecha_registro
-            RETURNING id
-        """
         return await conn.fetchval(
-            query,
-            evento_id, discord_id_str, nombre, titulo, url_portada, url_pdf, _now_iso()
+            """
+            INSERT INTO participantes
+                (evento_id, usuario_discord_id, usuario_nombre, titulo_historia, fecha_registro)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (evento_id, usuario_discord_id)
+            DO UPDATE SET
+                usuario_nombre  = EXCLUDED.usuario_nombre,
+                titulo_historia = COALESCE(EXCLUDED.titulo_historia, participantes.titulo_historia)
+            RETURNING id
+            """,
+            evento_id, str(discord_id), nombre, titulo, _now_iso(),
         )
 
 
-async def obtener_participante(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> Optional[Dict[str, Any]]:
-    discord_id_str = str(discord_id)
+async def obtener_participante_por_usuario(pool: asyncpg.Pool, evento_id: int, discord_id) -> Optional[Dict[str, Any]]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM participantes WHERE evento_id = $1 AND usuario_discord_id = $2",
-            evento_id, discord_id_str
+            evento_id, str(discord_id),
         )
         return dict(row) if row else None
 
 
-async def obtener_todos_participantes(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
+async def obtener_participantes(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM participantes WHERE evento_id = $1 ORDER BY id ASC",
-            evento_id
-        )
+        rows = await conn.fetch("SELECT * FROM participantes WHERE evento_id = $1 ORDER BY id ASC", evento_id)
         return [dict(r) for r in rows]
+
+
+async def actualizar_pdf(pool: asyncpg.Pool, participante_id: int, url: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE participantes SET url_pdf = $1 WHERE id = $2", url, participante_id)
+
+
+async def actualizar_portada(pool: asyncpg.Pool, participante_id: int, url: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE participantes SET url_portada = $1 WHERE id = $2", url, participante_id)
+
+
+async def contar_documentos_subidos(pool: asyncpg.Pool, evento_id: int) -> int:
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT COUNT(*) FROM participantes WHERE evento_id = $1 AND url_pdf IS NOT NULL", evento_id
+        )
+        return val or 0
 
 
 # ─────────────────────────── Asistencia en Voz ───────────────────────────
 
 async def registrar_entrada_voz(pool: asyncpg.Pool, evento_id: int, discord_id, narracion_id=None) -> None:
-    """Registra cuándo entra un usuario al canal de voz."""
+    """Registra la entrada de un usuario al canal de voz (si no tiene ya una sesión abierta)."""
     discord_id_str = str(discord_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 AND timestamp_salida IS NULL",
-            evento_id, discord_id_str
+            evento_id, discord_id_str,
         )
         if not row:
             await conn.execute(
-                "INSERT INTO asistencia_voz (evento_id, narracion_id, usuario_discord_id, timestamp_entrada) VALUES ($1, $2, $3, $4)",
-                evento_id, narracion_id, discord_id_str, _now_iso()
+                "INSERT INTO asistencia_voz (evento_id, narracion_id, usuario_discord_id, timestamp_entrada) "
+                "VALUES ($1, $2, $3, $4)",
+                evento_id, narracion_id, discord_id_str, _now_iso(),
             )
 
 
-async def registrar_salida_voz(pool: asyncpg.Pool, evento_id: int, discord_id, narracion_id=None) -> None:
-    """Calcula y guarda el tiempo que estuvo conectado."""
-    discord_id_str = str(discord_id)
+async def registrar_salida_voz(pool: asyncpg.Pool, evento_id: int, discord_id) -> None:
+    """Cierra la sesión de voz abierta del usuario y guarda los minutos."""
     now_dt = _now()
-    now_iso = now_dt.isoformat()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 AND timestamp_salida IS NULL ORDER BY id DESC LIMIT 1",
-            evento_id, discord_id_str
+            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2 "
+            "AND timestamp_salida IS NULL ORDER BY id DESC LIMIT 1",
+            evento_id, str(discord_id),
         )
         if row:
-            t_ent = datetime.fromisoformat(row["timestamp_entrada"])
-            t_sal = now_dt
-            mins = (t_sal - t_ent).total_seconds() / 60.0
-
             await conn.execute(
                 "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
-                now_iso, mins, row["id"]
+                now_dt.isoformat(), _minutos_desde(row["timestamp_entrada"], now_dt), row["id"],
             )
 
 
-async def obtener_minutos_asistencia(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> float:
-    """Suma total de minutos de un usuario en un evento."""
-    discord_id_str = str(discord_id)
+async def obtener_usuarios_con_sesion_abierta(pool: asyncpg.Pool, evento_id: int) -> set[str]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT usuario_discord_id FROM asistencia_voz WHERE evento_id = $1 AND timestamp_salida IS NULL",
+            evento_id,
+        )
+        return {r["usuario_discord_id"] for r in rows}
+
+
+async def cerrar_sesiones_abiertas(pool: asyncpg.Pool, evento_id: int) -> None:
+    """Cierra todas las sesiones de voz sin timestamp_salida."""
+    now_dt = _now()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND timestamp_salida IS NULL",
+            evento_id,
+        )
+        for row in rows:
+            await conn.execute(
+                "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
+                now_dt.isoformat(), _minutos_desde(row["timestamp_entrada"], now_dt), row["id"],
+            )
+
+
+async def calcular_asistencia_total(pool: asyncpg.Pool, evento_id: int) -> Dict[str, float]:
+    """{discord_id: minutos_totales} para el evento."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id, SUM(minutos_totales) AS total FROM asistencia_voz "
+            "WHERE evento_id = $1 GROUP BY usuario_discord_id",
+            evento_id,
+        )
+        return {r["usuario_discord_id"]: float(r["total"] or 0) for r in rows}
+
+
+async def contar_asistentes_narracion(pool: asyncpg.Pool, narracion_id: int) -> int:
+    """Usuarios distintos que estuvieron en una sesión concreta de narración."""
     async with pool.acquire() as conn:
         val = await conn.fetchval(
-            "SELECT SUM(minutos_totales) FROM asistencia_voz WHERE evento_id = $1 AND usuario_discord_id = $2",
-            evento_id, discord_id_str
+            "SELECT COUNT(DISTINCT usuario_discord_id) FROM asistencia_voz WHERE narracion_id = $1", narracion_id
         )
-        return float(val) if val else 0.0
+        return val or 0
 
 
-# ─────────────────────────── Estadísticas Globales ───────────────────────────
+# ─────────────────────────── Estadísticas ───────────────────────────
 
 async def contar_libros_biblioteca(pool: asyncpg.Pool) -> int:
-    """Cuenta el total histórico de cuentos/libros registrados en todas las veladas."""
-    # Como el usuario usa esto incluso cuando el bot arranca, verificamos que el pool exista
+    """Total histórico de historias registradas en todos los retos."""
     if not pool:
         return 0
     try:
         async with pool.acquire() as conn:
-            val = await conn.fetchval("SELECT COUNT(*) FROM participantes")
-            return val or 0
-    except Exception as e:
+            return await conn.fetchval("SELECT COUNT(*) FROM participantes") or 0
+    except Exception as e:  # noqa: BLE001
         log.error(f"Error contando libros: {e}")
-        return 0
-
-
-async def contar_veladas_realizadas(pool: asyncpg.Pool) -> int:
-    """Cuenta el total histórico de eventos cerrados."""
-    if not pool:
-        return 0
-    try:
-        async with pool.acquire() as conn:
-            val = await conn.fetchval("SELECT COUNT(*) FROM eventos")
-            return val or 0
-    except Exception as e:
-        log.error(f"Error contando veladas: {e}")
         return 0
 
 
 # ─────────────────────────── Votación ───────────────────────────
 
 async def configurar_votos_max(pool: asyncpg.Pool, evento_id: int, max_votos: int) -> None:
-    """Configura el número máximo de votos por usuario para un evento."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE eventos SET votos_max_por_usuario = $1 WHERE id = $2",
-            max_votos, evento_id
-        )
-
-
-async def obtener_votos_max(pool: asyncpg.Pool, evento_id: int) -> int:
-    """Retorna el límite de votos por usuario del evento (default 1)."""
-    async with pool.acquire() as conn:
-        val = await conn.fetchval(
-            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
-            evento_id
-        )
-        return val if val else 1
+        await conn.execute("UPDATE eventos SET votos_max_por_usuario = $1 WHERE id = $2", max_votos, evento_id)
 
 
 async def contar_votos_usuario(pool: asyncpg.Pool, evento_id: int, votante_discord_id) -> int:
-    """Cuenta cuántos votos ha emitido un usuario en un evento."""
-    votante_str = str(votante_discord_id)
     async with pool.acquire() as conn:
         val = await conn.fetchval(
             "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, votante_str
+            evento_id, str(votante_discord_id),
         )
         return val or 0
 
 
-async def registrar_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id, participante_id: int, es_valido: bool = True) -> bool:
-    """Registra un voto. Verifica que no exceda el límite y que no vote 2 veces por la misma historia."""
-    votante_str = str(votante_discord_id)
-    es_valido_int = 1 if es_valido else 0
-    async with pool.acquire() as conn:
-        # Verificar si ya votó por esta misma historia
-        ya_voto_historia = await conn.fetchrow(
-            "SELECT id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND participante_id = $3",
-            evento_id, votante_str, participante_id
-        )
-        if ya_voto_historia:
-            return False  # Ya votó por esta historia
-
-        # Verificar límite de votos
-        votos_max = await conn.fetchval(
-            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
-            evento_id
-        ) or 1
-        votos_actuales = await conn.fetchval(
-            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, votante_str
-        ) or 0
-
-        if votos_actuales >= votos_max:
-            return False  # Ya usó todos sus votos
-
-        await conn.execute(
-            "INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto, es_valido) VALUES ($1, $2, $3, $4, $5)",
-            evento_id, votante_str, participante_id, _now_iso(), es_valido_int
-        )
-        return True
-
-
-async def obtener_voto_usuario(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> Optional[int]:
-    """Retorna el primer participante_id por el que votó (compatibilidad)."""
-    votante_str = str(votante_discord_id)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND es_valido = 1 LIMIT 1",
-            evento_id, votante_str
-        )
-        return row["participante_id"] if row else None
-
-
 async def obtener_votos_usuario_lista(pool: asyncpg.Pool, evento_id: int, votante_discord_id) -> list[int]:
-    """Retorna la lista de participante_ids por los que ya votó el usuario."""
-    votante_str = str(votante_discord_id)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT participante_id FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, votante_str
+            evento_id, str(votante_discord_id),
         )
         return [r["participante_id"] for r in rows]
 
 
-async def anular_voto(pool: asyncpg.Pool, evento_id: int, votante_discord_id: int) -> bool:
-    """Anula TODOS los votos de un usuario en un evento."""
+# Resultados posibles de registrar_voto
+VOTO_OK = "ok"
+VOTO_DUPLICADO = "duplicado"
+VOTO_LIMITE = "limite"
+VOTO_CERRADO = "cerrado"
+VOTO_INVALIDO = "invalido"
+
+
+async def registrar_voto(
+    pool: asyncpg.Pool,
+    evento_id: int,
+    votante_discord_id,
+    participante_id: int,
+    es_valido: bool = True,
+) -> str:
+    """
+    Registra un voto de forma atómica.
+
+    Toda la comprobación (estado del evento, historia válida, no auto-voto,
+    duplicado y límite) ocurre dentro de una transacción con un bloqueo por
+    votante, para que dos clics simultáneos no superen el límite.
+    Retorna una de las constantes VOTO_*.
+    """
     votante_str = str(votante_discord_id)
     async with pool.acquire() as conn:
-        res = await conn.execute(
-            "UPDATE votos SET es_valido = 0 WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, votante_str
-        )
-        # res looks like "UPDATE 1"
-        return res != "UPDATE 0"
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", evento_id, votante_str)
 
-
-async def contar_votos(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
-    """
-    Retorna lista de participantes ordenados por votos (de mayor a menor).
-    Formato: [{'participante_id': 1, 'nombre': 'Juan', 'votos': 5}, ...]
-    """
-    async with pool.acquire() as conn:
-        query = """
-            SELECT p.id as participante_id, p.usuario_nombre as nombre, COUNT(v.id) as votos
-            FROM participantes p
-            LEFT JOIN votos v ON p.id = v.participante_id AND v.es_valido = 1
-            WHERE p.evento_id = $1
-            GROUP BY p.id, p.usuario_nombre
-            ORDER BY votos DESC, p.id ASC
-        """
-        rows = await conn.fetch(query, evento_id)
-        return [dict(r) for r in rows]
-
-
-# ─────────────────────────── Control de Fraude ───────────────────────────
-
-async def habilitar_votante(pool: asyncpg.Pool, evento_id: int, discord_id: int, minutos: float) -> None:
-    discord_id_str = str(discord_id)
-    async with pool.acquire() as conn:
-        query = """
-            INSERT INTO habilitados_voto (evento_id, usuario_discord_id, minutos_presencia)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (evento_id, usuario_discord_id) 
-            DO UPDATE SET minutos_presencia = EXCLUDED.minutos_presencia
-        """
-        await conn.execute(query, evento_id, discord_id_str, minutos)
-
-
-async def incrementar_documentos_descargados(pool: asyncpg.Pool, evento_id: int, discord_id: int, participante_id: int) -> None:
-    """Registra la descarga de un documento y aumenta el contador del usuario si es un documento nuevo."""
-    discord_id_str = str(discord_id)
-    async with pool.acquire() as conn:
-        # Verificar si ya lo descargó
-        row = await conn.fetchrow(
-            "SELECT 1 FROM descargas_documentos WHERE evento_id = $1 AND usuario_discord_id = $2 AND participante_id = $3",
-            evento_id, discord_id_str, participante_id
-        )
-        if not row:
-            # Registrar descarga
-            await conn.execute(
-                "INSERT INTO descargas_documentos (evento_id, usuario_discord_id, participante_id, timestamp_descarga) VALUES ($1, $2, $3, $4)",
-                evento_id, discord_id_str, participante_id, _now_iso()
+            evento = await conn.fetchrow(
+                "SELECT estado, votos_max_por_usuario FROM eventos WHERE id = $1", evento_id
             )
-            # Incrementar contador general
-            await conn.execute(
-                """
-                INSERT INTO habilitados_voto (evento_id, usuario_discord_id, documentos_descargados)
-                VALUES ($1, $2, 1)
-                ON CONFLICT (evento_id, usuario_discord_id) 
-                DO UPDATE SET documentos_descargados = habilitados_voto.documentos_descargados + 1
-                """,
-                evento_id, discord_id_str
+            if not evento or evento["estado"] != "votando":
+                return VOTO_CERRADO
+
+            autor = await conn.fetchval(
+                "SELECT usuario_discord_id FROM participantes WHERE id = $1 AND evento_id = $2",
+                participante_id, evento_id,
             )
+            if autor is None or autor == votante_str:
+                return VOTO_INVALIDO
 
-
-async def obtener_estatus_votante(pool: asyncpg.Pool, evento_id: int, discord_id: int) -> Optional[Dict[str, Any]]:
-    discord_id_str = str(discord_id)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT minutos_presencia, documentos_descargados FROM habilitados_voto WHERE evento_id = $1 AND usuario_discord_id = $2",
-            evento_id, discord_id_str
-        )
-        return dict(row) if row else None
-
-
-# ─────────────────────────── Historial de Eventos ───────────────────────────
-
-async def obtener_ultimos_eventos(pool: asyncpg.Pool, limite: int = 5) -> list[Dict[str, Any]]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM eventos WHERE estado = 'cerrado' ORDER BY id DESC LIMIT $1",
-            limite
-        )
-        return [dict(r) for r in rows]
-
-
-# ─────────────────── Funciones de compatibilidad con Cogs ───────────────────
-
-# Alias: los cogs usan este nombre
-async def cambiar_estado_evento(pool, evento_id, estado):
-    return await actualizar_estado_evento(pool, evento_id, estado)
-
-
-async def obtener_participante_por_usuario(pool, evento_id, discord_id):
-    return await obtener_participante(pool, evento_id, discord_id)
-
-
-async def obtener_participantes(pool, evento_id):
-    return await obtener_todos_participantes(pool, evento_id)
-
-
-async def actualizar_pdf(pool, participante_id, url):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE participantes SET url_pdf = $1 WHERE id = $2",
-            url, participante_id
-        )
-
-
-async def actualizar_portada(pool, participante_id, url):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE participantes SET url_portada = $1 WHERE id = $2",
-            url, participante_id
-        )
-
-
-async def crear_narracion(pool, evento_id):
-    """Crea una nueva narración. Retorna (narracion_id, numero_sesion)."""
-    async with pool.acquire() as conn:
-        # Obtener el número de sesión siguiente
-        val = await conn.fetchval(
-            "SELECT COALESCE(MAX(numero_sesion), 0) + 1 FROM narraciones WHERE evento_id = $1",
-            evento_id
-        )
-        sesion = val or 1
-        nid = await conn.fetchval(
-            "INSERT INTO narraciones (evento_id, numero_sesion, timestamp_inicio) VALUES ($1, $2, $3) RETURNING id",
-            evento_id, sesion, _now_iso()
-        )
-        return nid, sesion
-
-
-async def obtener_narraciones(pool, evento_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM narraciones WHERE evento_id = $1 ORDER BY numero_sesion ASC",
-            evento_id
-        )
-        return [dict(r) for r in rows]
-
-
-async def cerrar_narracion_activa(pool, evento_id):
-    """Cierra la narración activa. Retorna (narracion_id, duracion_min, numero_sesion) o None."""
-    now_dt = _now()
-    now_iso = now_dt.isoformat()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, timestamp_inicio, numero_sesion FROM narraciones WHERE evento_id = $1 AND timestamp_fin IS NULL ORDER BY numero_sesion DESC LIMIT 1",
-            evento_id
-        )
-        if not row:
-            return None
-        t_inicio = datetime.fromisoformat(row["timestamp_inicio"])
-        t_fin = now_dt
-        duracion_min = (t_fin - t_inicio).total_seconds() / 60.0
-        await conn.execute(
-            "UPDATE narraciones SET timestamp_fin = $1, duracion_minutos = $2 WHERE id = $3",
-            now_iso, duracion_min, row["id"]
-        )
-        await conn.execute(
-            "UPDATE eventos SET duracion_narracion_minutos = duracion_narracion_minutos + $1 WHERE id = $2",
-            duracion_min, evento_id
-        )
-        return row["id"], duracion_min, row["numero_sesion"]
-
-
-async def cerrar_sesiones_abiertas(pool, evento_id):
-    """Cierra todas las sesiones de voz que no tengan timestamp_salida."""
-    now_dt = _now()
-    now_iso = now_dt.isoformat()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, timestamp_entrada FROM asistencia_voz WHERE evento_id = $1 AND timestamp_salida IS NULL",
-            evento_id
-        )
-        for row in rows:
-            t_ent = datetime.fromisoformat(row["timestamp_entrada"])
-            t_sal = now_dt
-            mins = (t_sal - t_ent).total_seconds() / 60.0
-            await conn.execute(
-                "UPDATE asistencia_voz SET timestamp_salida = $1, minutos_totales = $2 WHERE id = $3",
-                now_iso, mins, row["id"]
+            ya = await conn.fetchval(
+                "SELECT 1 FROM votos WHERE evento_id = $1 AND votante_discord_id = $2 AND participante_id = $3",
+                evento_id, votante_str, participante_id,
             )
+            if ya:
+                return VOTO_DUPLICADO
+
+            usados = await conn.fetchval(
+                "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
+                evento_id, votante_str,
+            ) or 0
+            if usados >= (evento["votos_max_por_usuario"] or 1):
+                return VOTO_LIMITE
+
+            try:
+                await conn.execute(
+                    "INSERT INTO votos (evento_id, votante_discord_id, participante_id, timestamp_voto, es_valido) "
+                    "VALUES ($1, $2, $3, $4, $5)",
+                    evento_id, votante_str, participante_id, _now_iso(), 1 if es_valido else 0,
+                )
+            except asyncpg.UniqueViolationError:
+                return VOTO_DUPLICADO
+            return VOTO_OK
 
 
-async def calcular_asistencia_total(pool, evento_id) -> Dict[str, float]:
-    """Retorna {discord_id: minutos_totales} para el evento."""
+async def obtener_resultados_votacion(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT usuario_discord_id, SUM(minutos_totales) as total FROM asistencia_voz WHERE evento_id = $1 GROUP BY usuario_discord_id",
-            evento_id
-        )
-        return {r["usuario_discord_id"]: float(r["total"] or 0) for r in rows}
-
-
-async def guardar_duracion_total_narraciones(pool, evento_id):
-    async with pool.acquire() as conn:
-        val = await conn.fetchval(
-            "SELECT COALESCE(SUM(duracion_minutos), 0) FROM narraciones WHERE evento_id = $1",
-            evento_id
-        )
-        await conn.execute(
-            "UPDATE eventos SET duracion_narracion_minutos = $1 WHERE id = $2",
-            float(val or 0), evento_id
-        )
-
-
-async def contar_documentos_subidos(pool, evento_id) -> int:
-    async with pool.acquire() as conn:
-        val = await conn.fetchval(
-            "SELECT COUNT(*) FROM participantes WHERE evento_id = $1 AND url_pdf IS NOT NULL",
-            evento_id
-        )
-        return val or 0
-
-
-async def calcular_descargas_por_usuario(pool, evento_id) -> Dict[str, int]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT usuario_discord_id, COUNT(*) as total FROM descargas_documentos WHERE evento_id = $1 GROUP BY usuario_discord_id",
-            evento_id
-        )
-        return {r["usuario_discord_id"]: int(r["total"]) for r in rows}
-
-
-async def guardar_habilitados(pool, evento_id, habilitados_dict):
-    async with pool.acquire() as conn:
-        for uid, stats in habilitados_dict.items():
-            await conn.execute(
-                """INSERT INTO habilitados_voto (evento_id, usuario_discord_id, minutos_presencia, documentos_descargados)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (evento_id, usuario_discord_id)
-                DO UPDATE SET minutos_presencia = EXCLUDED.minutos_presencia, documentos_descargados = EXCLUDED.documentos_descargados""",
-                evento_id, uid, stats.get("minutos", 0), stats.get("descargas", 0)
-            )
-
-
-async def ya_voto(pool, evento_id, discord_id) -> bool:
-    """Retorna True si el usuario ya usó TODOS sus votos disponibles."""
-    async with pool.acquire() as conn:
-        votos_max = await conn.fetchval(
-            "SELECT votos_max_por_usuario FROM eventos WHERE id = $1",
-            evento_id
-        ) or 1
-        votos_usados = await conn.fetchval(
-            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND votante_discord_id = $2",
-            evento_id, str(discord_id)
-        ) or 0
-        return votos_usados >= votos_max
-
-
-async def esta_habilitado(pool, evento_id, discord_id) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM habilitados_voto WHERE evento_id = $1 AND usuario_discord_id = $2",
-            evento_id, str(discord_id)
-        )
-        return row is not None
-
-
-async def registrar_descarga(pool, evento_id, discord_id, participante_id):
-    return await incrementar_documentos_descargados(pool, evento_id, discord_id, participante_id)
-
-
-async def obtener_resultados_votacion(pool, evento_id) -> list[Dict[str, Any]]:
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT p.usuario_nombre, p.titulo_historia, COUNT(v.id) as total_votos
+            """SELECT p.usuario_nombre, p.titulo_historia, COUNT(v.id) AS total_votos
             FROM participantes p
             LEFT JOIN votos v ON p.id = v.participante_id AND v.es_valido = 1
             WHERE p.evento_id = $1
             GROUP BY p.id, p.usuario_nombre, p.titulo_historia
             ORDER BY total_votos DESC, p.id ASC""",
-            evento_id
+            evento_id,
         )
         return [dict(r) for r in rows]
 
 
-async def contar_votos_totales(pool, evento_id) -> Dict[str, int]:
+async def contar_votos_totales(pool: asyncpg.Pool, evento_id: int) -> Dict[str, int]:
     async with pool.acquire() as conn:
-        validos = await conn.fetchval(
-            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND es_valido = 1", evento_id
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) FILTER (WHERE es_valido = 1) AS validos, "
+            "COUNT(*) FILTER (WHERE es_valido = 0) AS nulos FROM votos WHERE evento_id = $1",
+            evento_id,
         )
-        nulos = await conn.fetchval(
-            "SELECT COUNT(*) FROM votos WHERE evento_id = $1 AND es_valido = 0", evento_id
-        )
-        return {"validos": validos or 0, "nulos": nulos or 0}
+        return {"validos": row["validos"] or 0, "nulos": row["nulos"] or 0}
 
 
-async def obtener_votos_nulos(pool, evento_id) -> list[Dict[str, Any]]:
+async def obtener_votos_nulos(pool: asyncpg.Pool, evento_id: int) -> list[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT v.votante_discord_id, p.titulo_historia
             FROM votos v
             JOIN participantes p ON v.participante_id = p.id
             WHERE v.evento_id = $1 AND v.es_valido = 0""",
-            evento_id
+            evento_id,
         )
         return [dict(r) for r in rows]
+
+
+# ─────────────────────────── Control de Fraude ───────────────────────────
+#
+# `habilitados_voto` SOLO se escribe en guardar_habilitados(), que llama
+# /evento iniciar_votacion tras evaluar los umbrales. Las descargas se anotan
+# únicamente en `descargas_documentos`; antes también creaban una fila en
+# habilitados_voto, lo que habilitaba a cualquiera con un solo clic.
+
+async def registrar_descarga(pool: asyncpg.Pool, evento_id: int, discord_id, participante_id: int) -> None:
+    """Anota que el usuario descargó un documento (una vez por documento)."""
+    # La PK (evento_id, usuario_discord_id, participante_id) evita duplicados,
+    # incluso con dos clics simultáneos.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO descargas_documentos (evento_id, usuario_discord_id, participante_id, timestamp_descarga) "
+            "VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            evento_id, str(discord_id), participante_id, _now_iso(),
+        )
+
+
+async def calcular_descargas_por_usuario(pool: asyncpg.Pool, evento_id: int) -> Dict[str, int]:
+    """{discord_id: nº de documentos distintos descargados} en el evento."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id, COUNT(DISTINCT participante_id) AS total FROM descargas_documentos "
+            "WHERE evento_id = $1 GROUP BY usuario_discord_id",
+            evento_id,
+        )
+        return {r["usuario_discord_id"]: int(r["total"]) for r in rows}
+
+
+async def guardar_habilitados(pool: asyncpg.Pool, evento_id: int, habilitados_dict: Dict[str, Dict[str, Any]]) -> None:
+    """Reemplaza por completo la lista de habilitados del evento."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM habilitados_voto WHERE evento_id = $1", evento_id)
+            for uid, stats in habilitados_dict.items():
+                await conn.execute(
+                    "INSERT INTO habilitados_voto (evento_id, usuario_discord_id, minutos_presencia, documentos_descargados) "
+                    "VALUES ($1, $2, $3, $4)",
+                    evento_id, uid, stats.get("minutos", 0), stats.get("descargas", 0),
+                )
+
+
+async def esta_habilitado(pool: asyncpg.Pool, evento_id: int, discord_id) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM habilitados_voto WHERE evento_id = $1 AND usuario_discord_id = $2",
+            evento_id, str(discord_id),
+        )
+        return row is not None
 
 
 # ─────────────────────────── Documentos Persistentes ───────────────────────────
@@ -721,140 +899,49 @@ async def guardar_documento(
     tamanio_bytes: Optional[int] = None,
 ) -> str:
     """
-    Inserta o actualiza el documento de un participante.
-    Incrementa el número de versión en cada actualización.
+    Inserta o actualiza el documento de un participante (incrementa la versión).
     Retorna la url_activa (respaldo si existe, discord si no).
     """
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO documentos_participantes
-                (participante_id, evento_id, usuario_discord_id, tipo,
-                 url_discord, url_respaldo, nombre_archivo, content_type,
-                 tamanio_bytes, version, fecha_subida)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, NOW())
-            ON CONFLICT (participante_id, tipo)
-            DO UPDATE SET
-                url_discord       = EXCLUDED.url_discord,
-                url_respaldo      = COALESCE(EXCLUDED.url_respaldo, documentos_participantes.url_respaldo),
-                nombre_archivo    = COALESCE(EXCLUDED.nombre_archivo, documentos_participantes.nombre_archivo),
-                content_type      = COALESCE(EXCLUDED.content_type, documentos_participantes.content_type),
-                tamanio_bytes     = COALESCE(EXCLUDED.tamanio_bytes, documentos_participantes.tamanio_bytes),
-                version           = documentos_participantes.version + 1,
-                fecha_actualizacion = NOW()
-            RETURNING url_activa
-            """,
-            participante_id, evento_id, usuario_discord_id, tipo,
-            url_discord, url_respaldo, nombre_archivo, content_type, tamanio_bytes,
-        )
-
-        url_activa = row["url_activa"] if row else url_respaldo or url_discord
-
-        # Sincronizar con la tabla participantes para compatibilidad con código existente
-        if tipo == "pdf":
-            await conn.execute(
-                "UPDATE participantes SET url_pdf = $1 WHERE id = $2",
-                url_activa, participante_id,
-            )
-        elif tipo == "portada":
-            await conn.execute(
-                "UPDATE participantes SET url_portada = $1 WHERE id = $2",
-                url_activa, participante_id,
-            )
-
-        return url_activa
-
-
-async def obtener_documento(
-    pool: asyncpg.Pool,
-    participante_id: int,
-    tipo: str,  # 'pdf' | 'portada'
-) -> Optional[Dict[str, Any]]:
-    """Retorna el documento activo de un participante."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT url_activa, url_discord, url_respaldo,
-                   nombre_archivo, version, fecha_subida
-            FROM documentos_participantes
-            WHERE participante_id = $1 AND tipo = $2
-            """,
-            participante_id, tipo,
-        )
-        return dict(row) if row else None
-
-
-async def obtener_documentos_evento(
-    pool: asyncpg.Pool,
-    evento_id: int,
-    tipo: Optional[str] = None,  # None = todos, 'pdf' | 'portada'
-) -> list[Dict[str, Any]]:
-    """Retorna todos los documentos de un evento, opcionalmente filtrados por tipo."""
-    async with pool.acquire() as conn:
-        if tipo:
-            rows = await conn.fetch(
+        async with conn.transaction():
+            row = await conn.fetchrow(
                 """
-                SELECT * FROM v_documentos_completos
-                WHERE evento_id = $1 AND tipo = $2
-                ORDER BY participante_id ASC
+                INSERT INTO documentos_participantes
+                    (participante_id, evento_id, usuario_discord_id, tipo,
+                     url_discord, url_respaldo, nombre_archivo, content_type,
+                     tamanio_bytes, version, fecha_subida)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, NOW())
+                ON CONFLICT (participante_id, tipo)
+                DO UPDATE SET
+                    url_discord         = EXCLUDED.url_discord,
+                    -- Un archivo nuevo sin respaldo NO debe heredar el respaldo del archivo anterior
+                    url_respaldo        = EXCLUDED.url_respaldo,
+                    nombre_archivo      = COALESCE(EXCLUDED.nombre_archivo, documentos_participantes.nombre_archivo),
+                    content_type        = COALESCE(EXCLUDED.content_type, documentos_participantes.content_type),
+                    tamanio_bytes       = COALESCE(EXCLUDED.tamanio_bytes, documentos_participantes.tamanio_bytes),
+                    version             = documentos_participantes.version + 1,
+                    fecha_actualizacion = NOW()
+                RETURNING url_activa
                 """,
-                evento_id, tipo,
+                participante_id, evento_id, usuario_discord_id, tipo,
+                url_discord, url_respaldo, nombre_archivo, content_type, tamanio_bytes,
             )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT * FROM v_documentos_completos
-                WHERE evento_id = $1
-                ORDER BY participante_id ASC, tipo ASC
-                """,
-                evento_id,
-            )
-        return [dict(r) for r in rows]
+            url_activa = (row["url_activa"] if row else None) or url_respaldo or url_discord
 
-
-async def actualizar_url_respaldo_documento(
-    pool: asyncpg.Pool,
-    participante_id: int,
-    tipo: str,
-    url_respaldo: str,
-) -> None:
-    """
-    Actualiza solo la URL de respaldo de un documento ya guardado.
-    Útil cuando el reenvío al canal privado tarda o falla inicialmente.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE documentos_participantes
-            SET url_respaldo = $1, fecha_actualizacion = NOW()
-            WHERE participante_id = $2 AND tipo = $3
-            """,
-            url_respaldo, participante_id, tipo,
-        )
-        # Sincronizar participantes con la nueva url_activa
-        row = await conn.fetchrow(
-            "SELECT url_activa FROM documentos_participantes WHERE participante_id = $1 AND tipo = $2",
-            participante_id, tipo,
-        )
-        if row:
+            # Mantener sincronizada la tabla participantes (la usan los cogs)
             col = "url_pdf" if tipo == "pdf" else "url_portada"
-            await conn.execute(
-                f"UPDATE participantes SET {col} = $1 WHERE id = $2",
-                row["url_activa"], participante_id,
-            )
+            await conn.execute(f"UPDATE participantes SET {col} = $1 WHERE id = $2", url_activa, participante_id)
+            return url_activa
 
 
 async def sincronizar_urls_desde_documentos(pool: asyncpg.Pool, evento_id: int) -> int:
     """
-    Utilidad de mantenimiento: recorre documentos_participantes y actualiza
-    la tabla participantes con las url_activa más recientes.
-    Útil para ejecutar después de un reinicio si hay desincronización.
-    Retorna el número de filas actualizadas.
+    Mantenimiento: copia a `participantes` las url_activa de documentos_participantes.
+    Útil si alguna vez quedan desincronizadas. Retorna el número de filas actualizadas.
     """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT participante_id, tipo, url_activa FROM documentos_participantes WHERE evento_id = $1",
-            evento_id,
+            "SELECT participante_id, tipo, url_activa FROM documentos_participantes WHERE evento_id = $1", evento_id
         )
         updated = 0
         for row in rows:
@@ -862,22 +949,18 @@ async def sincronizar_urls_desde_documentos(pool: asyncpg.Pool, evento_id: int) 
                 continue
             col = "url_pdf" if row["tipo"] == "pdf" else "url_portada"
             result = await conn.execute(
-                f"UPDATE participantes SET {col} = $1 WHERE id = $2",
-                row["url_activa"], row["participante_id"],
+                f"UPDATE participantes SET {col} = $1 WHERE id = $2", row["url_activa"], row["participante_id"]
             )
             if result != "UPDATE 0":
                 updated += 1
         return updated
 
+
 # ─────────────────────────── Memoria de Ribby ───────────────────────────
 
 async def obtener_memoria_usuario(pool: asyncpg.Pool, discord_id: int) -> Optional[Dict[str, Any]]:
-    """Carga el resumen de memoria de un usuario. Retorna None si no existe."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM ribby_memoria WHERE usuario_discord_id = $1",
-            str(discord_id)
-        )
+        row = await conn.fetchrow("SELECT * FROM ribby_memoria WHERE usuario_discord_id = $1", str(discord_id))
         return dict(row) if row else None
 
 
@@ -888,7 +971,7 @@ async def guardar_memoria_usuario(
     mood: str,
     interacciones: int,
 ) -> None:
-    """Crea o actualiza el resumen de memoria de un usuario (upsert)."""
+    """Crea o actualiza la memoria de un usuario (upsert)."""
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -901,5 +984,571 @@ async def guardar_memoria_usuario(
                 interacciones = EXCLUDED.interacciones,
                 ultima_actualizacion = EXCLUDED.ultima_actualizacion
             """,
-            str(discord_id), resumen, mood, interacciones, _now_iso()
+            # ultima_actualizacion es timestamptz: asyncpg exige un datetime, no un string ISO
+            str(discord_id), resumen, mood, interacciones, _now(),
         )
+
+
+# ─────────────────────────── Biblioteca de recomendaciones ───────────────────────────
+
+_SQL_CATALOGO = """
+    SELECT b.*,
+           COALESCE(b.autor_discord_id, a.discord_id) AS autor_discord,
+           p.url_pdf, p.url_portada AS portada_reto, p.usuario_discord_id AS participante_discord,
+           e.nombre AS evento_nombre,
+           COALESCE((SELECT array_agg(t.valor ORDER BY t.valor)
+                     FROM biblioteca_etiquetas t WHERE t.historia_id = b.id), '{}') AS tags,
+           (SELECT ROUND(AVG(r.puntuacion)::numeric, 1) FROM resenas r WHERE r.historia_id = b.id) AS nota_media,
+           (SELECT COUNT(*) FROM resenas r WHERE r.historia_id = b.id) AS num_resenas
+    FROM biblioteca_historias b
+    LEFT JOIN autores_wattpad a ON a.wattpad_username = lower(b.autor_wattpad)
+    LEFT JOIN participantes p ON p.id = b.participante_id
+    LEFT JOIN eventos e ON e.id = p.evento_id
+"""
+
+
+def _fila_catalogo(r) -> Dict[str, Any]:
+    d = dict(r)
+    d["tags"] = list(d.get("tags") or [])
+    d["nota_media"] = float(d["nota_media"]) if d.get("nota_media") is not None else None
+    return d
+
+
+async def listar_catalogo(pool: asyncpg.Pool) -> list[Dict[str, Any]]:
+    """Todas las historias de la biblioteca con sus tags y datos de reto."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_SQL_CATALOGO + " ORDER BY b.id")
+        return [_fila_catalogo(r) for r in rows]
+
+
+async def obtener_historia_biblioteca(pool: asyncpg.Pool, historia_id: int) -> Optional[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(_SQL_CATALOGO + " WHERE b.id = $1", historia_id)
+        return _fila_catalogo(row) if row else None
+
+
+async def _reemplazar_tags_wattpad(conn, historia_id: int, tags: list[str]) -> None:
+    """Sincroniza los tags que vienen de Wattpad sin tocar los aportados por personas."""
+    await conn.execute(
+        "DELETE FROM biblioteca_etiquetas WHERE historia_id = $1 AND fuente = 'wattpad' AND NOT (valor = ANY($2::text[]))",
+        historia_id, tags,
+    )
+    if tags:
+        await conn.execute(
+            "INSERT INTO biblioteca_etiquetas (historia_id, valor, fuente) "
+            "SELECT $1, unnest($2::text[]), 'wattpad' ON CONFLICT DO NOTHING",
+            historia_id, tags,
+        )
+
+
+async def guardar_historia_wattpad(
+    pool: asyncpg.Pool, datos: Dict[str, Any], agregada_por: Optional[str] = None
+) -> tuple[int, bool]:
+    """
+    Inserta o actualiza una historia de Wattpad (datos de wattpad._normalizar).
+    Retorna (historia_id, es_nueva). Una descripción escrita por el autor en
+    Discord no se sobrescribe con la de Wattpad.
+    """
+    hid, nueva, _ = await guardar_historia_wattpad_detalle(pool, datos, agregada_por)
+    return hid, nueva
+
+
+async def guardar_historia_wattpad_detalle(
+    pool: asyncpg.Pool, datos: Dict[str, Any], agregada_por: Optional[str] = None
+) -> tuple[int, bool, Optional[int]]:
+    """Como guardar_historia_wattpad, pero retorna también el número de partes que tenía antes."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            partes_antes = await conn.fetchval(
+                "SELECT partes FROM biblioteca_historias WHERE wattpad_id = $1", datos["wattpad_id"]
+            )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO biblioteca_historias
+                    (fuente, wattpad_id, titulo, autor_nombre, autor_wattpad, descripcion, descripcion_fuente,
+                     url, portada_url, lecturas, votos, partes, completada, madura, agregada_por, fecha_sync)
+                VALUES ('wattpad', $1, $2, $3, $4, $5, CASE WHEN $5::text IS NULL THEN NULL ELSE 'wattpad' END,
+                        $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+                ON CONFLICT (wattpad_id) DO UPDATE SET
+                    titulo        = EXCLUDED.titulo,
+                    autor_nombre  = EXCLUDED.autor_nombre,
+                    autor_wattpad = EXCLUDED.autor_wattpad,
+                    descripcion   = CASE WHEN biblioteca_historias.descripcion_fuente = 'autor'
+                                         THEN biblioteca_historias.descripcion
+                                         ELSE COALESCE(EXCLUDED.descripcion, biblioteca_historias.descripcion) END,
+                    descripcion_fuente = CASE WHEN biblioteca_historias.descripcion_fuente = 'autor' THEN 'autor'
+                                         WHEN EXCLUDED.descripcion IS NOT NULL THEN 'wattpad'
+                                         ELSE biblioteca_historias.descripcion_fuente END,
+                    url           = EXCLUDED.url,
+                    portada_url   = EXCLUDED.portada_url,
+                    lecturas      = EXCLUDED.lecturas,
+                    votos         = EXCLUDED.votos,
+                    partes        = EXCLUDED.partes,
+                    completada    = EXCLUDED.completada,
+                    madura        = EXCLUDED.madura,
+                    fecha_sync    = NOW()
+                RETURNING id, (xmax = 0) AS nueva
+                """,
+                datos["wattpad_id"], datos["titulo"], datos.get("autor_nombre"), datos.get("autor_wattpad"),
+                datos.get("descripcion"), datos.get("url"), datos.get("portada_url"), datos.get("lecturas"),
+                datos.get("votos"), datos.get("partes"), datos.get("completada"), bool(datos.get("madura")),
+                agregada_por,
+            )
+            await _reemplazar_tags_wattpad(conn, row["id"], datos.get("tags") or [])
+            return row["id"], bool(row["nueva"]), partes_antes
+
+
+async def sincronizar_retos_biblioteca(pool: asyncpg.Pool) -> int:
+    """Crea la ficha de biblioteca de cada participante de reto que aún no la tenga."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            """
+            INSERT INTO biblioteca_historias (fuente, participante_id, titulo, autor_nombre, autor_discord_id)
+            SELECT 'reto', p.id, COALESCE(NULLIF(p.titulo_historia, ''), 'Sin título'), p.usuario_nombre, p.usuario_discord_id
+            FROM participantes p
+            WHERE NOT EXISTS (SELECT 1 FROM biblioteca_historias b WHERE b.participante_id = p.id)
+            """
+        )
+        return int(res.split()[-1]) if res else 0
+
+
+async def historia_de_participante(pool: asyncpg.Pool, participante_id: int) -> int:
+    """ID de la ficha de biblioteca del participante (la crea o actualiza su título)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, fuente FROM biblioteca_historias WHERE participante_id = $1", participante_id
+        )
+        p = await conn.fetchrow(
+            "SELECT titulo_historia, usuario_nombre, usuario_discord_id FROM participantes WHERE id = $1", participante_id
+        )
+        titulo = (p["titulo_historia"] if p else None) or "Sin título"
+        if row:
+            if row["fuente"] == "reto":  # El título de Wattpad manda sobre el del registro
+                await conn.execute("UPDATE biblioteca_historias SET titulo = $1 WHERE id = $2", titulo, row["id"])
+            return row["id"]
+        return await conn.fetchval(
+            "INSERT INTO biblioteca_historias (fuente, participante_id, titulo, autor_nombre, autor_discord_id) "
+            "VALUES ('reto', $1, $2, $3, $4) RETURNING id",
+            participante_id, titulo, p["usuario_nombre"] if p else None, p["usuario_discord_id"] if p else None,
+        )
+
+
+async def asociar_participante(pool: asyncpg.Pool, historia_id: int, participante_id: int, discord_id: str) -> None:
+    """
+    Une la ficha de Wattpad `historia_id` con un participante de reto. Si el
+    participante ya tenía su propia ficha de reto, se fusiona (tags y resumen)
+    y se elimina para que no haya duplicados.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            previa = await conn.fetchrow(
+                "SELECT id, descripcion, descripcion_fuente FROM biblioteca_historias "
+                "WHERE participante_id = $1 AND id <> $2",
+                participante_id, historia_id,
+            )
+            if previa:
+                await conn.execute(
+                    "INSERT INTO biblioteca_etiquetas (historia_id, valor, fuente, aportado_por) "
+                    "SELECT $1, valor, fuente, aportado_por FROM biblioteca_etiquetas WHERE historia_id = $2 "
+                    "ON CONFLICT DO NOTHING",
+                    historia_id, previa["id"],
+                )
+                if previa["descripcion"] and previa["descripcion_fuente"] == "autor":
+                    await conn.execute(
+                        "UPDATE biblioteca_historias SET descripcion = $1, descripcion_fuente = 'autor' WHERE id = $2",
+                        previa["descripcion"], historia_id,
+                    )
+                await conn.execute("DELETE FROM biblioteca_historias WHERE id = $1", previa["id"])
+            await conn.execute(
+                "UPDATE biblioteca_historias SET participante_id = $1, autor_discord_id = $2 WHERE id = $3",
+                participante_id, discord_id, historia_id,
+            )
+
+
+async def agregar_etiquetas(
+    pool: asyncpg.Pool, historia_id: int, valores: list[str], fuente: str, aportado_por: Optional[str]
+) -> int:
+    """Añade tags (en minúsculas, sin duplicados). Retorna cuántos eran nuevos."""
+    limpios = sorted({v.strip().lower()[:60] for v in valores if v and v.strip()})
+    if not limpios:
+        return 0
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "INSERT INTO biblioteca_etiquetas (historia_id, valor, fuente, aportado_por) "
+            "SELECT $1, unnest($2::text[]), $3, $4 ON CONFLICT DO NOTHING",
+            historia_id, limpios, fuente, aportado_por,
+        )
+        return int(res.split()[-1])
+
+
+async def guardar_descripcion(
+    pool: asyncpg.Pool, historia_id: int, texto: str, fuente: str
+) -> bool:
+    """
+    Guarda el resumen de una historia. El autor siempre puede escribirlo;
+    el resto solo si la historia aún no tiene uno. Retorna si se guardó.
+    """
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            """
+            UPDATE biblioteca_historias SET descripcion = $1, descripcion_fuente = $2
+            WHERE id = $3 AND ($2 = 'autor' OR descripcion IS NULL OR descripcion = '')
+            """,
+            texto.strip()[:2000], fuente, historia_id,
+        )
+        return res != "UPDATE 0"
+
+
+async def vincular_autor_wattpad(pool: asyncpg.Pool, wattpad_username: str, discord_id: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO autores_wattpad (wattpad_username, discord_id) VALUES (lower($1), $2) "
+            "ON CONFLICT (wattpad_username) DO UPDATE SET discord_id = EXCLUDED.discord_id, fecha = NOW()",
+            wattpad_username, discord_id,
+        )
+
+
+async def eliminar_historia_biblioteca(pool: asyncpg.Pool, historia_id: int) -> bool:
+    async with pool.acquire() as conn:
+        return await conn.execute("DELETE FROM biblioteca_historias WHERE id = $1", historia_id) != "DELETE 0"
+
+
+# ─────────────────────────── Medidor de corazones ───────────────────────────
+
+_CAMPOS_AFINIDAD = (
+    "corazones", "es_pareja", "fecha_inicio_pareja", "racha_dias", "ultima_interaccion", "total_interacciones",
+    "corazones_hoy", "dia_corazones", "coqueteos", "fecha_maximo", "ultimo_regalo", "ultima_cita",
+    "ultima_declaracion", "dias_descontados", "citas_total", "regalos_total", "quiz_aciertos",
+)
+_CAMPOS_FECHA = ("fecha_inicio_pareja", "ultima_interaccion", "fecha_maximo", "ultima_declaracion")
+
+
+def _estado_desde_fila(row) -> Dict[str, Any]:
+    estado: Dict[str, Any] = {c: row[c] for c in _CAMPOS_AFINIDAD}
+    estado["corazones"] = float(estado["corazones"] or 0)
+    estado["corazones_hoy"] = float(estado["corazones_hoy"] or 0)
+    estado["es_pareja"] = bool(estado["es_pareja"])
+    for c in ("racha_dias", "total_interacciones", "coqueteos", "dias_descontados", "citas_total", "regalos_total",
+              "quiz_aciertos"):
+        estado[c] = int(estado[c] or 0)
+    for c in _CAMPOS_FECHA:  # Datos antiguos con otro formato: se descartan en vez de romper
+        try:
+            if estado[c]:
+                _parse_ts(estado[c])
+        except ValueError:
+            estado[c] = None
+    try:
+        eventos = json.loads(row["historial_eventos"] or "[]")
+        estado["eventos"] = [e for e in eventos if isinstance(e, dict) and "texto" in e]
+    except (ValueError, TypeError):
+        estado["eventos"] = []
+    estado["usuario_discord_id"] = row["usuario_discord_id"]
+    estado["nombre_display"] = row["nombre_display"]
+    return estado
+
+
+async def obtener_afinidad(pool: asyncpg.Pool, discord_id) -> Optional[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM afinidad_usuarios WHERE usuario_discord_id = $1", str(discord_id))
+        return _estado_desde_fila(row) if row else None
+
+
+async def pareja_actual(pool: asyncpg.Pool) -> Optional[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM afinidad_usuarios WHERE es_pareja LIMIT 1")
+        return _estado_desde_fila(row) if row else None
+
+
+async def guardar_afinidad(pool: asyncpg.Pool, discord_id, nombre: str, estado: Dict[str, Any], nivel: str) -> None:
+    """
+    Guarda el estado completo. Si se intenta registrar una segunda pareja, el
+    índice único lanza asyncpg.UniqueViolationError (lo maneja quien llama).
+    """
+    valores = [estado.get(c) for c in _CAMPOS_AFINIDAD]
+    columnas = ", ".join(_CAMPOS_AFINIDAD)
+    marcadores = ", ".join(f"${i}" for i in range(5, 5 + len(_CAMPOS_AFINIDAD)))
+    actualizar = ", ".join(f"{c} = EXCLUDED.{c}" for c in _CAMPOS_AFINIDAD)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO afinidad_usuarios (usuario_discord_id, nombre_display, nivel_relacion, historial_eventos, {columnas})
+            VALUES ($1, $2, $3, $4, {marcadores})
+            ON CONFLICT (usuario_discord_id) DO UPDATE SET
+                nombre_display = EXCLUDED.nombre_display,
+                nivel_relacion = EXCLUDED.nivel_relacion,
+                historial_eventos = EXCLUDED.historial_eventos,
+                {actualizar}
+            """,
+            str(discord_id), nombre[:100], nivel, json.dumps(estado.get("eventos") or [], ensure_ascii=False), *valores,
+        )
+
+
+async def reiniciar_afinidad(pool: asyncpg.Pool, discord_id) -> bool:
+    async with pool.acquire() as conn:
+        return await conn.execute(
+            "DELETE FROM afinidad_usuarios WHERE usuario_discord_id = $1", str(discord_id)
+        ) != "DELETE 0"
+
+
+async def candidatos_iniciativa(pool: asyncpg.Pool, corazones_minimos: float = 45.0) -> list[Dict[str, Any]]:
+    """Usuarios con los que Ribby tiene confianza suficiente para escribirles por su cuenta."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM afinidad_usuarios WHERE (corazones >= $1 OR es_pareja) AND ultima_interaccion IS NOT NULL",
+            corazones_minimos,
+        )
+        return [_estado_desde_fila(r) for r in rows]
+
+
+# ─────────────────────────── Configuración de Ribby (clave/valor) ───────────────────────────
+
+async def config_obtener(pool: asyncpg.Pool, clave: str) -> Optional[str]:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT valor FROM ribby_config WHERE clave = $1", clave)
+
+
+async def config_guardar(pool: asyncpg.Pool, clave: str, valor: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO ribby_config (clave, valor) VALUES ($1, $2) "
+            "ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor, fecha = NOW()",
+            clave, valor,
+        )
+
+
+async def config_borrar(pool: asyncpg.Pool, clave: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM ribby_config WHERE clave = $1", clave)
+
+
+async def config_borrar_patron(pool: asyncpg.Pool, patron: str) -> int:
+    """Borra las claves que encajen con un patrón LIKE (p. ej. 'quiz:%')."""
+    async with pool.acquire() as conn:
+        return int((await conn.execute("DELETE FROM ribby_config WHERE clave LIKE $1", patron)).split()[-1])
+
+
+async def config_con_prefijo(pool: asyncpg.Pool, prefijo: str) -> Dict[str, str]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT clave, valor FROM ribby_config WHERE clave LIKE $1", prefijo + "%")
+        return {r["clave"]: r["valor"] for r in rows}
+
+
+async def retroceder_misiones(pool: asyncpg.Pool, discord_id, dias: float) -> None:
+    """Modo de pruebas: hace como si las misiones activas se hubieran asignado hace `dias` días."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE misiones_lectura SET fecha_asignada = fecha_asignada - make_interval(secs => $2) "
+            "WHERE usuario_discord_id = $1 AND estado = 'activa'",
+            str(discord_id), dias * 86400,
+        )
+
+
+# ─────────────────────────── Cumpleaños ───────────────────────────
+
+async def guardar_cumpleanos(pool: asyncpg.Pool, discord_id, dia: int, mes: int) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cumpleanos (usuario_discord_id, dia, mes) VALUES ($1, $2, $3) "
+            "ON CONFLICT (usuario_discord_id) DO UPDATE SET dia = EXCLUDED.dia, mes = EXCLUDED.mes",
+            str(discord_id), dia, mes,
+        )
+
+
+async def cumpleanos_del_dia(pool: asyncpg.Pool, dia: int, mes: int) -> list[str]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT usuario_discord_id FROM cumpleanos WHERE dia = $1 AND mes = $2", dia, mes)
+        return [r["usuario_discord_id"] for r in rows]
+
+
+async def tiene_cumpleanos(pool: asyncpg.Pool, discord_id) -> bool:
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval("SELECT 1 FROM cumpleanos WHERE usuario_discord_id = $1", str(discord_id)))
+
+
+# ─────────────────────────── Reseñas ───────────────────────────
+
+async def guardar_resena(
+    pool: asyncpg.Pool, historia_id: int, discord_id, nombre: str, puntuacion: int, texto: str
+) -> bool:
+    """Guarda (o reemplaza) la reseña de un usuario. Retorna True si es nueva."""
+    async with pool.acquire() as conn:
+        return bool(await conn.fetchval(
+            """
+            INSERT INTO resenas (historia_id, usuario_discord_id, usuario_nombre, puntuacion, texto)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (historia_id, usuario_discord_id) DO UPDATE SET
+                puntuacion = EXCLUDED.puntuacion, texto = EXCLUDED.texto,
+                usuario_nombre = EXCLUDED.usuario_nombre, fecha = NOW()
+            RETURNING (xmax = 0)
+            """,
+            historia_id, str(discord_id), nombre[:100], puntuacion, texto.strip()[:2000],
+        ))
+
+
+async def resenas_de_historia(pool: asyncpg.Pool, historia_id: int, limite: int = 5) -> list[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM resenas WHERE historia_id = $1 ORDER BY fecha DESC LIMIT $2", historia_id, limite
+        )
+        return [dict(r) for r in rows]
+
+
+async def contar_resenas_usuario(pool: asyncpg.Pool, discord_id) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM resenas WHERE usuario_discord_id = $1", str(discord_id)) or 0
+
+
+# ─────────────────────────── Misiones de lectura ───────────────────────────
+
+async def mision_activa(pool: asyncpg.Pool, discord_id) -> Optional[Dict[str, Any]]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM misiones_lectura WHERE usuario_discord_id = $1 AND estado = 'activa'", str(discord_id)
+        )
+        return dict(row) if row else None
+
+
+async def crear_mision(pool: asyncpg.Pool, discord_id, historia_id: int) -> int:
+    """Abandona la misión activa (si había) y crea una nueva."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE misiones_lectura SET estado = 'abandonada' WHERE usuario_discord_id = $1 AND estado = 'activa'",
+                str(discord_id),
+            )
+            return await conn.fetchval(
+                "INSERT INTO misiones_lectura (usuario_discord_id, historia_id) VALUES ($1, $2) RETURNING id",
+                str(discord_id), historia_id,
+            )
+
+
+async def completar_mision(pool: asyncpg.Pool, mision_id: int) -> bool:
+    async with pool.acquire() as conn:
+        return await conn.execute(
+            "UPDATE misiones_lectura SET estado = 'completada', fecha_completada = NOW() WHERE id = $1 AND estado = 'activa'",
+            mision_id,
+        ) != "UPDATE 0"
+
+
+async def contar_misiones_completadas(pool: asyncpg.Pool, discord_id) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM misiones_lectura WHERE usuario_discord_id = $1 AND estado = 'completada'", str(discord_id)
+        ) or 0
+
+
+async def historias_leidas(pool: asyncpg.Pool, discord_id) -> set[int]:
+    """Historias que el usuario ya reseñó o completó como misión."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT historia_id FROM resenas WHERE usuario_discord_id = $1 "
+            "UNION SELECT historia_id FROM misiones_lectura WHERE usuario_discord_id = $1 AND estado = 'completada'",
+            str(discord_id),
+        )
+        return {r["historia_id"] for r in rows}
+
+
+# ─────────────────────────── Logros ───────────────────────────
+
+async def logros_de(pool: asyncpg.Pool, discord_id) -> Dict[str, datetime]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT logro, fecha FROM logros_usuarios WHERE usuario_discord_id = $1", str(discord_id))
+        return {r["logro"]: r["fecha"] for r in rows}
+
+
+async def otorgar_logros(pool: asyncpg.Pool, discord_id, claves: list[str]) -> list[str]:
+    """Inserta los logros que aún no tenía. Retorna solo los recién desbloqueados."""
+    if not claves:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "INSERT INTO logros_usuarios (usuario_discord_id, logro) SELECT $1, unnest($2::text[]) "
+            "ON CONFLICT DO NOTHING RETURNING logro",
+            str(discord_id), list(claves),
+        )
+        return [r["logro"] for r in rows]
+
+
+# ─────────────────────────── Capítulos de la historia de Ribby ───────────────────────────
+
+async def capitulos_leidos(pool: asyncpg.Pool, discord_id) -> Dict[int, int]:
+    """{capítulo: elección tomada} de los capítulos que el usuario ya terminó."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT capitulo, eleccion FROM ribby_capitulos WHERE usuario_discord_id = $1", str(discord_id)
+        )
+        return {r["capitulo"]: r["eleccion"] for r in rows}
+
+
+async def guardar_capitulo(pool: asyncpg.Pool, discord_id, capitulo: int, eleccion: int) -> bool:
+    """Registra la primera lectura de un capítulo. Retorna False si ya lo había leído."""
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "INSERT INTO ribby_capitulos (usuario_discord_id, capitulo, eleccion) VALUES ($1, $2, $3) "
+            "ON CONFLICT DO NOTHING",
+            str(discord_id), capitulo, eleccion,
+        )
+        return res != "INSERT 0 0"
+
+
+# ─────────────────────────── Seguimiento de historias ───────────────────────────
+
+async def seguir_historia(pool: asyncpg.Pool, discord_id, historia_id: int) -> bool:
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "INSERT INTO seguimientos (usuario_discord_id, historia_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            str(discord_id), historia_id,
+        )
+        return res != "INSERT 0 0"
+
+
+async def dejar_de_seguir(pool: asyncpg.Pool, discord_id, historia_id: int) -> bool:
+    async with pool.acquire() as conn:
+        return await conn.execute(
+            "DELETE FROM seguimientos WHERE usuario_discord_id = $1 AND historia_id = $2", str(discord_id), historia_id
+        ) != "DELETE 0"
+
+
+async def interesados_en_historia(pool: asyncpg.Pool, historia_id: int) -> set[str]:
+    """Quien la sigue o la tiene como misión de lectura activa."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id FROM seguimientos WHERE historia_id = $1 "
+            "UNION SELECT usuario_discord_id FROM misiones_lectura WHERE historia_id = $1 AND estado = 'activa'",
+            historia_id,
+        )
+        return {r["usuario_discord_id"] for r in rows}
+
+
+async def historias_seguidas(pool: asyncpg.Pool, discord_id) -> list[int]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT historia_id FROM seguimientos WHERE usuario_discord_id = $1", str(discord_id))
+        return [r["historia_id"] for r in rows]
+
+
+async def contar_seguidores(pool: asyncpg.Pool, historia_ids: list[int]) -> int:
+    if not historia_ids:
+        return 0
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(DISTINCT usuario_discord_id) FROM seguimientos WHERE historia_id = ANY($1::int[])",
+            historia_ids,
+        ) or 0
+
+
+async def resenas_de_historias(pool: asyncpg.Pool, historia_ids: list[int], limite: int = 3) -> list[Dict[str, Any]]:
+    if not historia_ids:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT r.*, b.titulo FROM resenas r JOIN biblioteca_historias b ON b.id = r.historia_id "
+            "WHERE r.historia_id = ANY($1::int[]) ORDER BY r.fecha DESC LIMIT $2",
+            historia_ids, limite,
+        )
+        return [dict(r) for r in rows]
+
+
+async def ids_wattpad_guardados(pool: asyncpg.Pool) -> list[str]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT wattpad_id FROM biblioteca_historias WHERE wattpad_id IS NOT NULL")
+        return [r["wattpad_id"] for r in rows]

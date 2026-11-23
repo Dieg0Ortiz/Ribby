@@ -10,6 +10,7 @@ pasadas mediante resúmenes persistidos en base de datos.
 import logging
 import random
 import re
+from collections import OrderedDict
 from datetime import datetime, timezone
 from time import monotonic
 
@@ -18,6 +19,8 @@ from discord.ext import commands
 
 import config
 import database
+import afinidad
+import comun
 import personalidad as ribby
 from ai_providers import ProviderManager
 
@@ -28,6 +31,16 @@ COLORES_RIBBY = [0xF9A8D4, 0x8B5CF6, 0xEC4899, 0x06B6D4, 0x10B981, 0x6366F1]
 
 # Cada cuántas interacciones se genera un nuevo resumen de memoria
 _FRECUENCIA_RESUMEN = 5
+
+# Límites de memoria en RAM
+_MAX_RESPONDIDOS = 200
+_MAX_USUARIOS_EN_MEMORIA = 500
+
+# Límite de caracteres de un mensaje de Discord
+_MAX_CARACTERES_DISCORD = 2000
+
+# Ribby nunca hace ping a nadie con sus respuestas (evita @everyone inducido por la IA)
+_SIN_MENCIONES = discord.AllowedMentions.none()
 
 # ─────────────────────────── Detección de cortesía ───────────────────────────
 
@@ -71,8 +84,11 @@ class Saludos(commands.Cog):
         self.bot = bot
         self.db = bot.db  # type: ignore[attr-defined]
 
-        # Cache de IDs de mensajes ya respondidos para evitar duplicados
-        self._respondidos: set[int] = set()
+        # IDs de mensajes ya respondidos (ordenados por llegada) para evitar duplicados
+        self._respondidos: "OrderedDict[int, None]" = OrderedDict()
+
+        # Último instante (monotónico) en que cada usuario recibió respuesta de la IA
+        self._ultimo_uso_ia: dict[int, float] = {}
 
         # Estado en memoria por usuario (se carga desde BD en la primera interacción).
         # Estructura por usuario_id:
@@ -83,7 +99,7 @@ class Saludos(commands.Cog):
         #   "resumen": str,         # resumen persistido de conversaciones pasadas
         #   "cargado_db": bool,     # si ya se cargó desde la base de datos
         # }
-        self._estado_usuarios: dict[int, dict] = {}
+        self._estado_usuarios: "OrderedDict[int, dict]" = OrderedDict()
 
         # Canal -> instante monotónico hasta el cual no se intenta typing
         self._typing_silenciado_hasta: dict[int, float] = {}
@@ -104,8 +120,12 @@ class Saludos(commands.Cog):
         Retorna el estado del usuario. Si es la primera vez en esta sesión,
         carga mood, interacciones y resumen desde la base de datos.
         """
-        if usuario_id not in self._estado_usuarios:
-            # Inicializar con valores por defecto
+        if usuario_id in self._estado_usuarios:
+            self._estado_usuarios.move_to_end(usuario_id)
+        else:
+            # Evitar que la memoria crezca sin límite: se descarta el usuario menos reciente
+            while len(self._estado_usuarios) >= _MAX_USUARIOS_EN_MEMORIA:
+                self._estado_usuarios.popitem(last=False)
             self._estado_usuarios[usuario_id] = {
                 "mensajes": [],
                 "mood": "frio",
@@ -121,9 +141,9 @@ class Saludos(commands.Cog):
             try:
                 memoria = await database.obtener_memoria_usuario(self.db, usuario_id)
                 if memoria:
-                    estado["mood"] = memoria.get("mood", "frio")
-                    estado["interacciones"] = memoria.get("interacciones", 0)
-                    estado["resumen"] = memoria.get("resumen", "")
+                    estado["mood"] = memoria.get("mood") or "frio"
+                    estado["interacciones"] = memoria.get("interacciones") or 0
+                    estado["resumen"] = memoria.get("resumen") or ""
                     log.debug(
                         f"Memoria cargada para {usuario_id}: "
                         f"mood={estado['mood']}, interacciones={estado['interacciones']}"
@@ -218,54 +238,49 @@ class Saludos(commands.Cog):
                 return await self.model.generate(system_prompt, mensajes)
             raise
 
-    async def _actualizar_memoria_si_corresponde(
-        self, usuario_id: int, estado: dict, nombre_usuario: str
-    ) -> None:
+    async def _actualizar_memoria(self, usuario_id: int, estado: dict, nombre_usuario: str) -> None:
         """
-        Cada _FRECUENCIA_RESUMEN interacciones, pide a la IA un resumen compacto
-        del usuario y lo guarda en la base de datos. Consume tokens solo
-        ocasionalmente, no en cada mensaje.
+        Guarda en BD el mood y el número de interacciones en cada mensaje (es
+        barato) y, cada _FRECUENCIA_RESUMEN interacciones, pide a la IA un
+        resumen compacto del usuario.
         """
-        if estado["interacciones"] % _FRECUENCIA_RESUMEN != 0:
-            return
-        if not estado["mensajes"]:
-            return
+        if estado["interacciones"] % _FRECUENCIA_RESUMEN == 0 and estado["mensajes"]:
+            try:
+                historial_texto = "\n".join(
+                    f"{'Usuario' if m['role'] == 'user' else 'Ribby'}: {m['content']}"
+                    for m in estado["mensajes"]
+                )
+                prompt_sistema = (
+                    "Eres la memoria a largo plazo de Ribby, un bot de Discord. Recibes lo que Ribby ya recordaba "
+                    "de un usuario y su conversación más reciente. Devuelve la memoria ACTUALIZADA: conserva lo "
+                    "importante de antes y añade lo nuevo. Guarda datos concretos: cómo prefiere que le llamen, sus "
+                    "gustos (historias, Pokémon, aficiones), cosas importantes que haya contado de su vida, promesas o "
+                    "planes que mencionó y cómo es su trato con Ribby. Si algo nuevo contradice lo anterior, quédate con "
+                    "lo nuevo. Máximo 4 oraciones, en español, texto plano sin listas. No inventes nada."
+                )
+                pedido = (
+                    f"Usuario: {nombre_usuario}\n"
+                    f"Lo que Ribby ya recordaba: {estado.get('resumen') or '(nada todavía)'}\n"
+                    f"Conversación reciente:\n{historial_texto}"
+                )
+                resumen = await self.model.generate(prompt_sistema, [{"role": "user", "content": pedido}])
+                if resumen:
+                    # Limitado para no inflar el prompt de cada mensaje
+                    estado["resumen"] = resumen.strip()[:600]
+                    log.info(f"🧠 Memoria resumida para {usuario_id}: {estado['resumen'][:60]}...")
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"No se pudo generar el resumen de memoria de {usuario_id}: {e}")
 
         try:
-            # Construir un mini-historial legible para el prompt de resumen
-            historial_texto = "\n".join(
-                f"{'Usuario' if m['role'] == 'user' else 'Ribby'}: {m['content']}"
-                for m in estado["mensajes"]
+            await database.guardar_memoria_usuario(
+                self.db,
+                usuario_id,
+                resumen=estado.get("resumen", ""),
+                mood=estado["mood"],
+                interacciones=estado["interacciones"],
             )
-
-            prompt_resumen = (
-                "Eres un sistema de memoria para un bot de Discord llamado Ribby. "
-                "Basándote en la siguiente conversación, genera un resumen MUY corto (máximo 2 oraciones) "
-                "sobre el usuario. Incluye: su actitud general hacia Ribby, algún tema que haya mencionado, "
-                "y si Ribby le tiene simpatía o no. Sé conciso y en español. "
-                "No uses listas. Solo texto plano.\n\n"
-                f"Usuario: {nombre_usuario}\n"
-                f"Conversación:\n{historial_texto}"
-            )
-
-            resumen = await self.model.generate(prompt_resumen, [])
-
-            if resumen:
-                # Limitar el resumen a 300 caracteres para no inflar el prompt
-                resumen = resumen.strip()[:300]
-                estado["resumen"] = resumen
-
-                await database.guardar_memoria_usuario(
-                    self.db,
-                    usuario_id,
-                    resumen=resumen,
-                    mood=estado["mood"],
-                    interacciones=estado["interacciones"],
-                )
-                log.info(f"🧠 Memoria actualizada para {usuario_id}: {resumen[:60]}...")
-
-        except Exception as e:
-            log.warning(f"No se pudo actualizar memoria de {usuario_id}: {e}")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"No se pudo guardar la memoria de {usuario_id}: {e}")
 
     # ── Construcción del system prompt ───────────────────────────────
 
@@ -287,6 +302,7 @@ class Saludos(commands.Cog):
         es_colider: bool = False,
         apodo_colider: str = "",
         resumen: str = "",
+        relacion: str = "",
     ) -> str:
         """
         Genera el system prompt completo para Ribby según el contexto actual.
@@ -416,6 +432,10 @@ class Saludos(commands.Cog):
             f"- Nombre: '{nombre_usuario}'\n"
             f"- Familiaridad: {nota_familiaridad}\n"
             + (f"- Lo que recuerdas de conversaciones anteriores con esta persona: {resumen}\n" if resumen else "")
+            + (
+                "- VUESTRA RELACIÓN (tiene prioridad sobre el mood a la hora de decidir cuánto cariño muestras):\n"
+                f"{relacion}\n" if relacion else ""
+            )
             + f"{aviso_lider}"
             f"{aviso_colider}\n"
 
@@ -427,20 +447,30 @@ class Saludos(commands.Cog):
             "pero con tu voz característica — no como un manual aburrido.\n\n"
             "COMANDOS DE ADMINISTRADORES (solo el staff puede usarlos):\n"
             "- /evento crear [nombre]: Abre un nuevo reto literario e inicia las inscripciones.\n"
-            "- /evento configurar [canal_voz] [canal_envio]: Le dices dónde vigilar las narraciones y anunciar resultados.\n"
+            "- /evento configurar [canal_voz] [canal_envio] [canal_respaldo]: Le dices dónde vigilar las narraciones y dónde se suben las historias.\n"
+            "- /evento configurar_votos [cantidad]: Define cuántos votos (1 a 10) puede emitir cada persona.\n"
             "- /evento iniciar_narracion: Empieza a cronometrar una sesión de narración.\n"
             "- /evento cerrar_narracion: Pausa y guarda el tiempo exacto de esa sesión.\n"
             "- /evento iniciar_votacion: Cierra inscripciones y abre las urnas.\n"
             "- /evento cerrar: Hace el conteo final, anuncia al ganador y archiva el evento.\n\n"
             "COMANDOS PARA TODOS LOS USUARIOS:\n"
-            "- /participante_registrar [titulo] [archivo] [portada]: Inscribe una historia en el reto activo. Se puede volver a usar para actualizar.\n"
-            "- /votar: Abre una boleta secreta y privada para elegir tu historia favorita. Solo funciona durante la votación.\n"
+            "- /participante_registrar [titulo]: Inscribe una historia en el reto activo (se puede repetir para cambiar el título). "
+            "Después, el autor sube su documento (PDF/DOCX) y su portada (imagen) en el canal de envío y tú los recoges automáticamente.\n"
+            "- /votar: Abre una boleta secreta y privada para elegir tu historia favorita. Solo funciona durante la votación. "
+            "Si el staff lo configuró, se puede votar por varias historias distintas.\n"
             "- /reto info: Abre un libro interactivo con todas las obras inscritas. Tiene botones para pasar páginas y descargar PDFs.\n"
             "- /reto historial: Muestra un archivo de todos los retos anteriores con estadísticas, participantes y ganadores.\n"
             "- /help: Muestra el manual de usuario completo.\n\n"
+            "TU BIBLIOTECA DE RECOMENDACIONES:\n"
+            "Conoces las historias de los escritores de La Comarca (de Wattpad y de los retos). Si alguien te pide "
+            "una recomendación (\"recomiéndame una historia con Lycanroc\"), te pasa un enlace de Wattpad para que "
+            "lo guardes, o pregunta de qué trata una historia, eso lo atiendes con tus fichas. También existen "
+            "/biblioteca recomendar, /biblioteca agregar, /biblioteca ver, /biblioteca etiquetar, /biblioteca resumir "
+            "y /biblioteca vincular_wattpad (para que los autores vinculen su cuenta). Si te preguntan cómo pedir "
+            "recomendaciones, explícalo con tu voz.\n\n"
             "CÓMO FUNCIONA UN RETO (el ciclo de vida):\n"
             "Un reto pasa por fases: Registro (abierto) → Narraciones (pueden ser varias sesiones en días distintos) "
-            "→ Votación (voto secreto, anónimo, una vez por persona) → Cierre (ganador anunciado en embed dorado).\n\n"
+            "→ Votación (voto secreto y anónimo; uno o varios votos por persona según el reto) → Cierre (ganador anunciado en embed dorado).\n\n"
             "REGLA IMPORTANTE: Si alguien pregunta qué puedes hacer o cómo funciona algo, explícalo con tu voz — "
             "sarcástica si te lo preguntaron sin educación, paciente si fueron amables. "
             "Nunca leas los comandos como una lista fría. Habla como Ribby, no como un README.\n\n"
@@ -465,7 +495,19 @@ class Saludos(commands.Cog):
             "- Nunca uses listas con guiones o bullets. Habla en prosa natural.\n"
             "- PROHIBIDO usar estas frases: 'no dudes en preguntar', 'estoy aquí para ayudarte', "
             "'con mucho gusto', 'permíteme aclarar', 'de acuerdo', 'por supuesto'. Suenan a robot.\n"
+            f"- {afinidad.REGLAS_ROMANCE}\n"
+            "- Si te preguntan por tu relación con alguien, habla de ella con naturalidad. Los usuarios pueden ver "
+            "cómo les ves con /ribby corazones, hacerte regalos con /ribby regalar e invitarte a una cita con /ribby cita.\n"
         )
+
+    @staticmethod
+    async def _marcar_prueba(message: discord.Message) -> None:
+        """En modo de pruebas, Ribby marca sus respuestas con 🧪 para que no haya dudas."""
+        if comun.en_prueba(message.author.id):
+            try:
+                await message.add_reaction("🧪")
+            except discord.HTTPException:
+                pass
 
     # ── Listener principal ────────────────────────────────────────────
 
@@ -474,6 +516,7 @@ class Saludos(commands.Cog):
         # Ignorar mensajes del propio bot
         if message.author.bot:
             return
+        comun.marcar_usuario(message.author)  # Modo de pruebas: decide qué base de datos usar
 
         # Verificar que el bot fue mencionado
         if self.bot.user not in message.mentions:
@@ -482,21 +525,52 @@ class Saludos(commands.Cog):
         # Evitar responder al mismo mensaje más de una vez
         if message.id in self._respondidos:
             return
-        self._respondidos.add(message.id)
-
-        # Limpiar cache si crece demasiado
-        if len(self._respondidos) > 200:
-            self._respondidos = set(list(self._respondidos)[-100:])
+        self._respondidos[message.id] = None
+        while len(self._respondidos) > _MAX_RESPONDIDOS:
+            self._respondidos.popitem(last=False)  # Descarta los más antiguos
 
         # Limpiar el contenido: quitar menciones para analizar solo el texto
         texto = re.sub(r"<@!?\d+>", "", message.content).strip()
 
-        log.info(
-            f"💬 {message.author.display_name} mencionó a Ribby: \"{message.content}\""
-        )
+        log.info(f"💬 {message.author.display_name} mencionó a Ribby ({len(texto)} caracteres)")
+        log.debug(f"   Contenido: {texto!r}")
+
+        # Cooldown por usuario: protege la cuota de la IA frente a spam de menciones
+        ahora = monotonic()
+        if ahora - self._ultimo_uso_ia.get(message.author.id, 0.0) < config.AI_COOLDOWN_SECONDS:
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+            return
+        self._ultimo_uso_ia[message.author.id] = ahora
+
+        # Recomendaciones, links de Wattpad y "¿de qué trata...?" los atiende la biblioteca
+        biblioteca = self.bot.get_cog("Biblioteca")
+        if biblioteca is not None:
+            try:
+                if await biblioteca.manejar_mencion(message, texto):  # type: ignore[attr-defined]
+                    await self._marcar_prueba(message)
+                    return
+            except Exception as e:  # noqa: BLE001
+                log.exception(f"Error en la biblioteca: {e}")
 
         # Obtener tamaño de la biblioteca
         libros = await database.contar_libros_biblioteca(self.db)
+
+        # Medidor de corazones: actualiza la relación y da contexto a la IA
+        romance = self.bot.get_cog("Afinidad")
+        relacion = None
+        if romance is not None:
+            try:
+                relacion = await romance.procesar_mensaje(message, texto, _detectar_tono(texto))  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                log.exception(f"Error en el medidor de corazones: {e}")
+
+        async def tras_responder():
+            if romance is not None and relacion is not None:
+                await romance.despues_de_responder(message, relacion)  # type: ignore[attr-defined]
+            await self._marcar_prueba(message)
 
         if self.model:
             try:
@@ -511,8 +585,8 @@ class Saludos(commands.Cog):
                 self._actualizar_mood(estado, tono)
                 mood_actual = estado["mood"]
 
-                # ── 4. Incrementar contador de interacciones ──
-                estado["interacciones"] += 1
+                # ── 4. Número de esta interacción (se confirma solo si la IA responde) ──
+                interacciones = estado["interacciones"] + 1
 
                 # ── 5. Detectar si es co-líder ──
                 apodo_colider = self._CO_LIDERES.get(message.author.id, "")
@@ -522,28 +596,32 @@ class Saludos(commands.Cog):
                 system_prompt = self._construir_system_prompt(
                     nombre_usuario=message.author.display_name,
                     mood=mood_actual,
-                    interacciones=estado["interacciones"],
+                    interacciones=interacciones,
                     libros=libros,
                     es_lider=(message.author.id == 666664701228220424),
                     es_colider=es_colider,
                     apodo_colider=apodo_colider,
                     resumen=estado.get("resumen", ""),
+                    relacion=relacion.contexto if relacion else "",
                 )
 
-                # ── 7. Añadir mensaje actual al historial ──
-                estado["mensajes"].append({"role": "user", "content": texto})
-                self._limpiar_historial_si_necesario(estado)
+                # ── 7. Historial con el mensaje actual (aún sin guardar en el estado) ──
+                mensaje_usuario = {"role": "user", "content": texto or "(solo te mencionó)"}
+                historial = estado["mensajes"] + [mensaje_usuario]
 
                 # ── 8. Generar respuesta ──
                 response_text = await self._generar_con_typing_seguro(
                     message.channel,
                     system_prompt,
-                    estado["mensajes"],
+                    historial,
                 )
 
                 if response_text:
-                    # Guardar respuesta de Ribby en el historial
-                    estado["mensajes"].append({"role": "ribby", "content": response_text})
+                    response_text = response_text.strip()[:_MAX_CARACTERES_DISCORD]
+
+                    # Solo si la IA respondió se guarda el intercambio completo
+                    estado["mensajes"].extend([mensaje_usuario, {"role": "ribby", "content": response_text}])
+                    estado["interacciones"] = interacciones
                     self._limpiar_historial_si_necesario(estado)
 
                     log.info(
@@ -551,13 +629,12 @@ class Saludos(commands.Cog):
                         f"[mood={mood_actual}, interacciones={estado['interacciones']}, "
                         f"resumen={'sí' if estado.get('resumen') else 'no'}]"
                     )
-                    await message.reply(response_text, mention_author=False)
+                    await message.reply(response_text, mention_author=False, allowed_mentions=_SIN_MENCIONES)
+                    await tras_responder()
 
-                    # ── 9. Actualizar memoria en BD si toca ──
+                    # ── 9. Actualizar memoria en BD ──
                     # Se hace DESPUÉS de responder para no retrasar al usuario
-                    await self._actualizar_memoria_si_corresponde(
-                        message.author.id, estado, message.author.display_name
-                    )
+                    await self._actualizar_memoria(message.author.id, estado, message.author.display_name)
                     return
 
             except Exception as e:
@@ -579,7 +656,8 @@ class Saludos(commands.Cog):
         )
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_footer(text=f"Biblioteca de Ribby  •  {libros} libro(s) protegidos")
-        await message.reply(embed=embed, mention_author=False)
+        await message.reply(embed=embed, mention_author=False, allowed_mentions=_SIN_MENCIONES)
+        await tras_responder()
 
 
 async def setup(bot: commands.Bot):

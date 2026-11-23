@@ -15,8 +15,9 @@ load_dotenv()
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 
 # Guild IDs: puede ser uno o varios separados por comas
-_guild_raw = os.getenv("GUILD_ID", "0")
-GUILD_IDS: list[int] = [int(g.strip()) for g in _guild_raw.split(",") if g.strip()]
+# Sin valor por defecto: si no se define, los comandos se sincronizan de forma global.
+_guild_raw = os.getenv("GUILD_ID", "")
+GUILD_IDS: list[int] = [int(g.strip()) for g in _guild_raw.split(",") if g.strip() and g.strip() != "0"]
 GUILD_ID: int = GUILD_IDS[0] if GUILD_IDS else 0  # Compatibilidad con código existente
 
 # Gemini: Puede ser una sola llave o una lista separada por comas
@@ -24,9 +25,31 @@ _gemini_raw = os.getenv("GEMINI_API_KEY", "")
 GEMINI_API_KEYS: list[str] = [k.strip() for k in _gemini_raw.split(",") if k.strip()]
 GEMINI_API_KEY: str = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""
 
-# Otros proveedores (opcionales)
+# Claude (Anthropic): proveedor principal de IA si está configurado
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
+
+# Otros proveedores (opcionales, de respaldo)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+
+# Modelos de IA (configurables sin tocar código)
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+
+# Creador de Ribby (Tainy): Ribby le trata como a su padre. IDs de Discord separados por comas.
+# Si se deja vacío, se le reconoce por su nombre de usuario (ver comun.CREADOR_USUARIOS).
+CREADOR_IDS: list[int] = [int(x) for x in os.getenv("CREADOR_DISCORD_ID", "").replace(" ", "").split(",") if x.isdigit()]
+
+# Listas de lectura de Wattpad que forman la base de la biblioteca (IDs separados por comas).
+# Por defecto: "Historias de nuestro servidor" de La Comarca.
+WATTPAD_LISTAS: list[str] = [
+    x.strip() for x in os.getenv("WATTPAD_LISTAS", "1584836335").split(",") if x.strip()
+]
+
+# Segundos mínimos entre dos respuestas con IA para un mismo usuario (anti-spam / cuota).
+AI_COOLDOWN_SECONDS: int = int(os.getenv("AI_COOLDOWN_SECONDS", "8"))
 
 # Base de datos (Supabase)
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
@@ -41,6 +64,9 @@ ADMIN_ROLE_NAME: str = os.getenv("ADMIN_ROLE_NAME", "Admin Literario")
 
 # Porcentaje mínimo de asistencia en el canal de voz para poder votar (0.0 – 1.0).
 PORCENTAJE_ASISTENCIA_MINIMO: float = float(os.getenv("PORCENTAJE_ASISTENCIA", "0.70"))
+
+# Porcentaje mínimo de documentos descargados para que el voto sea válido (0.0 – 1.0).
+PORCENTAJE_LECTURA_MINIMO: float = float(os.getenv("PORCENTAJE_LECTURA", "0.50"))
 
 # ─────────────────────────── Embeds — Paleta Premium ───────────────────────────
 

@@ -16,48 +16,16 @@ from discord.ext import commands
 from datetime import datetime, timezone
 import math
 
+from typing import Optional
+
 import config
 import database
 import personalidad as ribby
+from comun import es_admin as _es_admin, limitar_bloque_embed as _limitar_bloque_embed
 
 
-def _es_admin(interaction: discord.Interaction) -> bool:
-    """Verifica si el usuario tiene el rol de administrador literario."""
-    return any(
-        role.name == config.ADMIN_ROLE_NAME for role in interaction.user.roles
-    )
-
-
-def _limitar_bloque_embed(lineas: list[str], limite: int = 1024) -> str:
-    """Recorta una lista de líneas para que quepa en un campo de embed."""
-    if not lineas:
-        return ""
-
-    resultado: list[str] = []
-    longitud = 0
-
-    for linea in lineas:
-        separador = 2 if resultado else 0
-        candidato = longitud + separador + len(linea)
-        if candidato > limite:
-            break
-
-        resultado.append(linea)
-        longitud = candidato
-
-    valor = "\n\n".join(resultado)
-    omitidas = len(lineas) - len(resultado)
-
-    if omitidas > 0:
-        sufijo = f"\n\n... y {omitidas} más"
-        if len(valor) + len(sufijo) > limite:
-            valor = valor[: max(0, limite - len(sufijo))]
-        valor += sufijo
-
-    if not valor:
-        return lineas[0][:limite]
-
-    return valor
+def _pct(valor: float) -> str:
+    return f"{round(valor * 100)}%"
 
 
 def _embed_error(titulo: str, descripcion: str) -> discord.Embed:
@@ -99,7 +67,7 @@ class Eventos(commands.Cog):
 
     @evento_group.command(name="crear", description="Crea un nuevo evento literario")
     @app_commands.describe(nombre="Nombre del evento (ej. 'Misterios — Reto #3')")
-    async def crear(self, interaction: discord.Interaction, nombre: str):
+    async def crear(self, interaction: discord.Interaction, nombre: app_commands.Range[str, 1, 200]):
         if not _es_admin(interaction):
             return await interaction.response.send_message(
                 embed=_embed_error("Sin permisos", "No tienes permisos para usar este comando."),
@@ -175,7 +143,7 @@ class Eventos(commands.Cog):
         interaction: discord.Interaction,
         canal_voz: discord.VoiceChannel,
         canal_envio: discord.TextChannel,
-        canal_respaldo: discord.TextChannel = None,
+        canal_respaldo: Optional[discord.TextChannel] = None,
     ):
         if not _es_admin(interaction):
             return await interaction.response.send_message(
@@ -346,15 +314,11 @@ class Eventos(commands.Cog):
 
         # Registrar automáticamente a los usuarios que ya están en el canal de voz
         registrados_previos = 0
-        canal_voz_id = activo["canal_voz_id"]
-        for member in interaction.guild.members:
-            if member.bot:
-                continue
-            if (
-                member.voice
-                and member.voice.channel
-                and member.voice.channel.id == canal_voz_id
-            ):
+        canal_voz = self.bot.get_channel(activo["canal_voz_id"])
+        if isinstance(canal_voz, (discord.VoiceChannel, discord.StageChannel)):
+            for member in canal_voz.members:
+                if member.bot:
+                    continue
                 await database.registrar_entrada_voz(
                     self.db, activo["id"], str(member.id), narracion_id
                 )
@@ -383,7 +347,7 @@ class Eventos(commands.Cog):
         )
         embed.add_field(
             name="⏱️  Asistencia mín.",
-            value=f"```{int(config.PORCENTAJE_ASISTENCIA_MINIMO * 100)}% del total```",
+            value=f"```{_pct(config.PORCENTAJE_ASISTENCIA_MINIMO)} del total```",
             inline=True,
         )
         embed.add_field(
@@ -443,12 +407,12 @@ class Eventos(commands.Cog):
 
         narr_id, duracion_min, numero_sesion = resultado
 
-        # Calcular asistencia de esta sesión
-        asistencia = await database.calcular_asistencia_total(self.db, activo["id"])
+        # Asistentes de esta sesión concreta
+        asistentes_sesion = await database.contar_asistentes_narracion(self.db, narr_id)
 
         # Obtener historial de todas las narraciones
         narraciones = await database.obtener_narraciones(self.db, activo["id"])
-        duracion_total = sum(n["duracion_minutos"] for n in narraciones)
+        duracion_total = sum(n["duracion_minutos"] or 0 for n in narraciones)
         total_sesiones = len(narraciones)
 
         # Cambiar estado de vuelta a abierto
@@ -477,8 +441,8 @@ class Eventos(commands.Cog):
             inline=True,
         )
         embed.add_field(
-            name="👥  Asistentes registrados",
-            value=f"```{len(asistencia)} usuario(s)```",
+            name="👥  Asistentes de la sesión",
+            value=f"```{asistentes_sesion} usuario(s)```",
             inline=True,
         )
         embed.add_field(
@@ -547,7 +511,7 @@ class Eventos(commands.Cog):
 
         # Calcular duración total de TODAS las narraciones
         narraciones = await database.obtener_narraciones(self.db, activo["id"])
-        duracion_total = sum(n["duracion_minutos"] for n in narraciones)
+        duracion_total = sum(n["duracion_minutos"] or 0 for n in narraciones)
         total_sesiones = len(narraciones)
 
         # Guardar duración total en el evento
@@ -559,15 +523,15 @@ class Eventos(commands.Cog):
 
         # ── Condición 2: Descargas de Documentos ──
         total_documentos = await database.contar_documentos_subidos(self.db, activo["id"])
-        umbral_lectura = math.ceil(total_documentos * 0.5)
+        umbral_lectura = max(1, math.ceil(total_documentos * config.PORCENTAJE_LECTURA_MINIMO))
         descargas_usuarios = await database.calcular_descargas_por_usuario(self.db, activo["id"])
 
         # ── Combinar habilitados ──
         habilitados_dict = {}
 
-        # 1. Procesar asistencia de voz
+        # 1. Procesar asistencia de voz (solo si hubo tiempo de narración que medir)
         for uid, mins in asistencia.items():
-            if mins >= umbral_voz:
+            if duracion_total > 0 and mins >= umbral_voz:
                 if uid not in habilitados_dict:
                     habilitados_dict[uid] = {"minutos": mins, "descargas": descargas_usuarios.get(uid, 0)}
 
@@ -641,12 +605,12 @@ class Eventos(commands.Cog):
         )
         admin_embed.add_field(
             name="🎙️  Umbral de Voz",
-            value=f"```{umbral_voz:.1f} min (70%)```",
+            value=f"```{umbral_voz:.1f} min ({_pct(config.PORCENTAJE_ASISTENCIA_MINIMO)})```",
             inline=True,
         )
         admin_embed.add_field(
             name="📥  Umbral de Lectura",
-            value=f"```{umbral_lectura} doc{'s' if umbral_lectura != 1 else ''} (50%)```",
+            value=f"```{umbral_lectura} doc{'s' if umbral_lectura != 1 else ''} ({_pct(config.PORCENTAJE_LECTURA_MINIMO)})```",
             inline=True,
         )
         admin_embed.add_field(
@@ -666,7 +630,7 @@ class Eventos(commands.Cog):
             for uid, stats in habilitados_dict.items():
                 member = guild.get_member(int(uid))
                 motivos = []
-                if stats["minutos"] >= umbral_voz: motivos.append("🎙️")
+                if duracion_total > 0 and stats["minutos"] >= umbral_voz: motivos.append("🎙️")
                 if total_documentos > 0 and stats["descargas"] >= umbral_lectura: motivos.append("📥")
 
                 motivo_icon = " ".join(motivos)
@@ -674,7 +638,7 @@ class Eventos(commands.Cog):
 
             admin_embed.add_field(
                 name="👥  Votos válidos de",
-                value="\n".join(nombres),
+                value=_limitar_bloque_embed(nombres, separador="\n"),
                 inline=False,
             )
 
@@ -705,9 +669,10 @@ class Eventos(commands.Cog):
 
         await interaction.response.defer()
 
-        # Si estaba en narración, cerrar sesiones abiertas
+        # Si estaba en narración, cerrar asistencia de voz Y la propia narración
         if activo["estado"] == "narrando":
             await database.cerrar_sesiones_abiertas(self.db, activo["id"])
+            await database.cerrar_narracion_activa(self.db, activo["id"])
 
         # Obtener resultados de votación
         resultados = await database.obtener_resultados_votacion(self.db, activo["id"])
@@ -810,7 +775,8 @@ class Eventos(commands.Cog):
                 nombre = member.display_name if member else f"ID:{vn['votante_discord_id']}"
                 nulos_lineas.append(
                     f"❌  **{nombre}** → votó por _{vn['titulo_historia'] or 'Sin título'}_\n"
-                    f"╰ Razón: No cumplió el 70% de voz ni el 50% de lectura"
+                    f"╰ Razón: No cumplió el {_pct(config.PORCENTAJE_ASISTENCIA_MINIMO)} de voz "
+                    f"ni el {_pct(config.PORCENTAJE_LECTURA_MINIMO)} de lectura"
                 )
             admin_embed.add_field(
                 name="🚫  Votos Anulados",

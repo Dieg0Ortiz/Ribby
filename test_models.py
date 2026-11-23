@@ -1,6 +1,9 @@
-import google.generativeai as genai
+"""Lista los modelos de Gemini disponibles para la primera llave configurada."""
+from google import genai
+
 import config
-genai.configure(api_key=config.GEMINI_API_KEY)
-for m in genai.list_models():
-    if 'generateContent' in m.supported_generation_methods:
+
+client = genai.Client(api_key=config.GEMINI_API_KEY)
+for m in client.models.list():
+    if "generateContent" in (m.supported_actions or []):
         print(m.name)

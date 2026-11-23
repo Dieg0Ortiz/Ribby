@@ -10,6 +10,7 @@ Listeners:
 """
 
 import logging
+import re
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -20,17 +21,11 @@ from discord.ext import commands
 import config
 import database
 import personalidad as ribby
+import comun
+import wattpad as wattpad_api
+from comun import en_servidores_configurados, es_admin as _es_admin
 
 log = logging.getLogger("bot-literario.participantes")
-
-
-def _es_admin(interaction: discord.Interaction) -> bool:
-    """Verifica si el usuario tiene el rol de administrador literario."""
-    if not isinstance(interaction.user, discord.Member):
-        return False
-    return any(
-        role.name == config.ADMIN_ROLE_NAME for role in interaction.user.roles
-    )
 
 
 # Extensiones válidas para documentos (historias)
@@ -58,13 +53,19 @@ class Participantes(commands.Cog):
     )
     @app_commands.describe(
         titulo="Título de tu historia",
+        etiquetas="(Opcional) Géneros, Pokémon y temas separados por comas: romance, lycanroc, escolar",
+        descripcion="(Opcional) Resumen corto de tu historia",
+        wattpad="(Opcional) Enlace a tu historia o a tu perfil de Wattpad",
         usuario="(Solo admins) El usuario a registrar. Si no se indica, te registras tú mismo.",
     )
-    @app_commands.guilds(*config.GUILD_IDS) if config.GUILD_IDS else lambda f: f
+    @en_servidores_configurados
     async def registrar(
         self,
         interaction: discord.Interaction,
-        titulo: str,
+        titulo: app_commands.Range[str, 1, 200],
+        etiquetas: Optional[app_commands.Range[str, 1, 300]] = None,
+        descripcion: Optional[app_commands.Range[str, 1, 1500]] = None,
+        wattpad: Optional[app_commands.Range[str, 1, 300]] = None,
         usuario: Optional[discord.Member] = None,
     ):
         # Determinar quién se registra
@@ -102,6 +103,10 @@ class Participantes(commands.Cog):
             )
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
+        # Consultar Wattpad puede tardar más de los 3 s que da Discord
+        await interaction.response.defer()
+
+        ya_registrado = await database.obtener_participante_por_usuario(self.db, activo["id"], objetivo.id)
         pid = await database.registrar_participante(
             self.db,
             activo["id"],
@@ -109,9 +114,10 @@ class Participantes(commands.Cog):
             objetivo.display_name,
             titulo,
         )
+        notas_biblioteca = await self._actualizar_biblioteca(pid, objetivo, etiquetas, descripcion, wattpad)
 
         embed = discord.Embed(
-            title="✨  ¡Registro Exitoso!",
+            title="✏️  Registro Actualizado" if ya_registrado else "✨  ¡Registro Exitoso!",
             description=(
                 f"{config.SEPARADOR}\n\n"
                 f"{ribby.frase(ribby.REGISTRO, usuario=objetivo.display_name)}\n\n"
@@ -128,14 +134,72 @@ class Participantes(commands.Cog):
         embed.add_field(name="\u200b", value="\u200b", inline=True)
         embed.add_field(
             name="📌  ¿Qué sigue?",
-            value="Sube tu documento (PDF/DOCX) y portada (imagen) en el canal de envío configurado.",
+            value=(
+                "Tus archivos ya subidos se conservan. Si quieres reemplazarlos, vuelve a subirlos en el canal de envío."
+                if ya_registrado else
+                "Sube tu documento (PDF/DOCX) y portada (imagen) en el canal de envío configurado."
+            ),
             inline=False,
         )
+        if notas_biblioteca:
+            embed.add_field(name="📚  Biblioteca de Ribby", value="\n".join(notas_biblioteca)[:1024], inline=False)
         embed.set_author(name="Ribby 🎀", icon_url=config.BOT_ICON_URL or None)
         embed.set_thumbnail(url=objetivo.display_avatar.url)
         embed.set_footer(text=ribby.tip_aleatorio())
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
+
+    async def _actualizar_biblioteca(
+        self,
+        participante_id: int,
+        autor: discord.abc.User,
+        etiquetas: Optional[str],
+        descripcion: Optional[str],
+        enlace_wattpad: Optional[str],
+    ) -> list[str]:
+        """Crea/actualiza la ficha de la historia en la biblioteca. Retorna notas para el usuario."""
+        notas: list[str] = []
+        autor_id = str(autor.id)
+        try:
+            historia_id = await database.historia_de_participante(self.db, participante_id)
+
+            if enlace_wattpad:
+                if "/story/" in enlace_wattpad or re.search(r"wattpad\.com/\d+", enlace_wattpad):
+                    datos = await wattpad_api.historia_desde_url(enlace_wattpad)
+                    if datos:
+                        wid, _ = await database.guardar_historia_wattpad(self.db, datos, autor_id)
+                        await database.asociar_participante(self.db, wid, participante_id, autor_id)
+                        if datos.get("autor_wattpad"):
+                            await database.vincular_autor_wattpad(self.db, datos["autor_wattpad"], autor_id)
+                        historia_id = wid
+                        notas.append(f"🔗 Vinculada con tu historia de Wattpad: **{datos['titulo']}**")
+                    else:
+                        notas.append("⚠️ No pude leer ese enlace de Wattpad (¿es público?).")
+                else:
+                    nombre = wattpad_api.usuario_de_url(enlace_wattpad)
+                    if nombre:
+                        await database.vincular_autor_wattpad(self.db, nombre, autor_id)
+                        notas.append(f"🔗 Perfil de Wattpad vinculado: **{nombre}**")
+                    else:
+                        notas.append("⚠️ Ese enlace de Wattpad no lo reconozco.")
+
+            if etiquetas:
+                tags = [t.strip().lstrip("#") for t in re.split(r"[,;\n]", etiquetas) if t.strip()]
+                await database.agregar_etiquetas(self.db, historia_id, tags, "autor", autor_id)
+                notas.append(f"🏷️ Etiquetas: {', '.join(tags)}")
+
+            if descripcion:
+                await database.guardar_descripcion(self.db, historia_id, descripcion, "autor")
+                notas.append("📝 Resumen guardado")
+
+            biblioteca = self.bot.get_cog("Biblioteca")
+            if biblioteca is not None:
+                biblioteca.invalidar()  # type: ignore[attr-defined]
+            if not (etiquetas and descripcion):
+                notas.append("💡 Puedes añadir etiquetas o un resumen cuando quieras con `/biblioteca etiquetar` y `/biblioteca resumir`.")
+        except Exception as e:  # noqa: BLE001 — la inscripción al reto no debe fallar por esto
+            log.warning(f"No se pudo actualizar la biblioteca para el participante {participante_id}: {e}")
+        return notas
 
     # ── Listener: Detección automática de archivos ──
 
@@ -146,6 +210,7 @@ class Participantes(commands.Cog):
         # Ignorar mensajes del bot
         if message.author.bot:
             return
+        comun.marcar_usuario(message.author)  # Modo de pruebas: decide qué base de datos usar
 
         # Ignorar mensajes sin adjuntos
         if not message.attachments:
@@ -276,6 +341,9 @@ class Participantes(commands.Cog):
 
         # Confirmar al usuario con un embed bonito
         if archivos_procesados:
+            biblioteca = self.bot.get_cog("Biblioteca")
+            if biblioteca is not None:
+                biblioteca.invalidar()  # type: ignore[attr-defined]
             # Contar libros en la biblioteca
             libros = await database.contar_libros_biblioteca(self.db)
 
