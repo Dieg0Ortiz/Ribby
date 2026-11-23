@@ -750,6 +750,19 @@ class Saludos(commands.Cog):
         estado = await self._obtener_estado(usuario_id)
         return estado["hechos"], estado["pendientes"], estado.get("resumen", "")
 
+    async def olvidar_conversaciones(self, guild_id: Optional[int] = None, comunidad: bool = False) -> None:
+        """
+        Borra lo que Ribby tiene presente de las conversaciones recientes de todos los canales (RAM) y,
+        si se pide, lo que recuerda de la comunidad (BD). Sirve para quitarle una idea errónea que
+        ella misma repite porque la ve en la conversación.
+        """
+        self.memoria.limpiar()
+        self._respuestas_desde_resumen.clear()
+        for estado in self._estado_usuarios.values():
+            estado["mensajes"] = []
+        if comunidad and guild_id is not None:
+            await database.config_borrar(self.db, f"memoria_comunidad:{guild_id}")
+
     async def recordar_dato(self, usuario_id: int, texto: str) -> None:
         """/ribby recordar: un dato que la persona pide que Ribby no olvide."""
         estado = await self._obtener_estado(usuario_id)
@@ -884,6 +897,13 @@ class Saludos(commands.Cog):
         relaciones = dict(relaciones_lista)
         lineas: list[str] = []
 
+        if not pareja:
+            # Sin este dato, Ribby se fía de lo que ella misma dijo antes en la conversación (aunque fuera un error)
+            lineas.append(
+                "- DATO VERIFICADO DE LA BASE DE DATOS: ahora mismo NO tienes pareja ni novio/novia. Esto manda sobre "
+                "cualquier cosa que recuerdes o que hayas dicho antes en esta conversación: si dijiste lo contrario, "
+                "te equivocaste. Si te preguntan, di que no tienes pareja (con tu estilo)."
+            )
         if pareja and pareja["usuario_discord_id"] != str(autor_id):
             linea = (
                 f"- Tu pareja actual es {pareja['nombre_display']}. Si preguntan por ella, dices quién es y hablas "

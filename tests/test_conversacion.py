@@ -276,5 +276,20 @@ class TestMemoriaEstructurada(unittest.TestCase):
         self.assertIn("examen (era ayer)", bloque)
 
 
+class TestAccionInicial(unittest.TestCase):
+    def test_quita_la_acotacion_pegada_al_principio(self):
+        self.assertEqual(conv.limpiar_respuesta("*Ribby se pone roja hasta las orejas y cierra el libro* ¡Tainy! 😳"), "¡Tainy! 😳")
+        self.assertEqual(conv.limpiar_respuesta("_Ribby suspira, resignada_ Vale."), "Vale.")
+
+    def test_no_toca_cursivas_normales(self):
+        for texto in ["Eso es *muy* interesante.", "*suspira* Vale.", "Hola *Ribby* dijo."]:
+            self.assertEqual(conv.limpiar_respuesta(texto), texto)
+
+    def test_historial_sin_acotaciones_de_ribby(self):
+        entradas = [_e(1, RIBBY, "Ribby", "*Ribby se sonroja* Hola, Tainy", 0, ribby=True)]
+        msgs = conv.mensajes_para_ia(entradas, _e(2, 2, "Tainy", "hola", 10), ahora=T0 + 10)
+        self.assertEqual(msgs[1]["content"], "Hola, Tainy")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -235,7 +235,9 @@ def _linea_usuario(e: Entrada, por_id: dict[int, Entrada], ahora: float, marca: 
 
 
 def _linea_ribby(e: Entrada) -> str:
-    return f"[{e.nota}]\n{e.texto}" if e.nota else e.texto
+    # Sin las acotaciones de narrador de sus mensajes viejos, la IA no las imita
+    texto = quitar_accion_inicial(e.texto) if e.es_ribby else e.texto
+    return f"[{e.nota}]\n{texto}" if e.nota else texto
 
 
 def mensajes_para_ia(
@@ -342,6 +344,13 @@ def extraer_marcas(texto: str) -> tuple[str, Marcas]:
 
 _RE_ACOTACION = re.compile(r"^\s*(\*[^*\n]+\*|_[^_\n]+_)\s*$")
 _RE_PREFIJO = re.compile(r"^\s*(\*\*)?Ribby(\s*\(tú\))?(\*\*)?\s*:\s*", re.I)
+# "*Ribby se pone roja hasta las orejas* ¡Tainy!..." → acotación de narrador pegada al principio del mensaje
+_RE_ACCION_INICIAL = re.compile(r"^\s*(\*|_)(?:Ribby|Ella)\b[^*_\n]{3,200}\1\s*", re.I)
+
+
+def quitar_accion_inicial(texto: str) -> str:
+    limpio = _RE_ACCION_INICIAL.sub("", texto or "", count=1)
+    return limpio if limpio.strip() else (texto or "")
 
 
 def limpiar_respuesta(texto: str) -> str:
@@ -354,4 +363,5 @@ def limpiar_respuesta(texto: str) -> str:
     while lineas and (not lineas[0].strip() or re.match(r"^\s*\[[^\]]*\]\s*$", lineas[0])):
         lineas.pop(0)
     limpio = _RE_PREFIJO.sub("", re.sub(r"\n{3,}", "\n\n", "\n".join(lineas)).strip(), count=1).strip()
+    limpio = quitar_accion_inicial(limpio).strip()
     return limpio or (texto or "").strip()

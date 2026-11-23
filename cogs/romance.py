@@ -1562,6 +1562,20 @@ class Afinidad(commands.Cog):
         )
         await self.aplicar_castigo(interaction, usuario, motivo, corazones, dias)
 
+    @grupo.command(name="limpiar_memoria", description="(Staff) Ribby olvida las conversaciones recientes y lo que recuerda de la comunidad")
+    async def cmd_limpiar_memoria(self, interaction: discord.Interaction):
+        if not es_admin(interaction):
+            return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is None:
+            return await interaction.response.send_message("Ahora mismo no puedo hacerlo 😶", ephemeral=True)
+        await saludos.olvidar_conversaciones(interaction.guild_id, comunidad=True)  # type: ignore[attr-defined]
+        await interaction.response.send_message(
+            "🧽 Ribby ha olvidado las conversaciones recientes de los canales y lo que recordaba de la comunidad. "
+            "Lo que recuerda de cada persona no se toca (cada uno puede borrarlo con `/ribby olvidar`).",
+            ephemeral=True,
+        )
+
     @grupo.command(name="perdonar", description="(Staff) Levanta el castigo: Ribby deja de estar enfadada con alguien")
     @app_commands.describe(usuario="A quién perdonar")
     async def cmd_perdonar(self, interaction: discord.Interaction, usuario: discord.Member):
@@ -1932,6 +1946,9 @@ class Afinidad(commands.Cog):
             return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
         ok = await database.reiniciar_afinidad(self.db, usuario.id)
         self.invalidar_caches(usuario.id)
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:  # Que no siga citando lo que dijo de esa persona en las conversaciones recientes
+            await saludos.olvidar_conversaciones()  # type: ignore[attr-defined]
         await interaction.response.send_message(
             f"🔄 Relación de {usuario.mention} con Ribby reiniciada." if ok else "Ese usuario no tenía nada con Ribby.",
             ephemeral=True,
