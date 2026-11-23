@@ -173,9 +173,16 @@ def parsear_respuesta(texto: str, ids_validos: set[int], maximo: int = 3) -> tup
 
 # ─────────────────────────── Intención de la mención ───────────────────────────
 
+# Solo peticiones reales. Antes bastaba con que apareciera "recomendaci…" o "recomiend…",
+# así que "te veo para obtener recomendaciones" o "te recomiendo esta historia" lanzaban
+# una recomendación que nadie había pedido.
 _RE_RECOMENDAR = re.compile(
-    r"recomi[eé]nd|recomendaci|sugi[eé]re|sugerenci|qu[eé] (puedo|deber[ií]a|me pongo a) leer|"
-    r"algo (para|que) leer|(busco|quiero|dame|tienes|conoces|hay) (una |alguna |otra |unas |algunas )?"
+    r"\brecomi[eé]nd(a|ame|anme|anos|as|es|enme)\b|\bme (puedes |podr[ií]as |quieres )?recomendar\b"
+    r"|\bsugi[eé]re(me|nos)?\b|\bme (puedes |podr[ií]as )?sugerir\b"
+    r"|\b(dame|danos|quiero|quisiera|necesito|tienes|tendr[aá]s|alguna|algunas|una|unas|otra|otras|me das|pido|busco)"
+    r"\s+(\w+\s+){0,2}?(recomendaci[oó]n|recomendaciones|sugerencias?)\b"
+    r"|qu[eé] (puedo|deber[ií]a|me pongo a) leer|algo (bueno )?(para|que) leer"
+    r"|(busco|quiero|dame|tienes|conoces|hay|sabes de) (una |alguna |otra |unas |algunas )?"
     r"(historias?|fics?|fanfics?|libros?|lecturas?)",
     re.I,
 )

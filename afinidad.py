@@ -336,25 +336,37 @@ def aplicar_paso_del_tiempo(estado: dict[str, Any], momento: Optional[datetime] 
 # ─────────────────────────── Contexto para la IA ───────────────────────────
 
 _COMO_ACTUAR = {
-    "desconocido": "Apenas conoces a esta persona. Eres educada pero reservada; no hay confianza todavía.",
-    "amigo": "Es tu amigo/a. Eres más cercana, bromeas con confianza y te alegra verle, aunque no lo admitas.",
+    "desconocido": (
+        "Apenas conoces a esta persona. Eres simpática y acogedora, con un poco de reserva: todavía no hay "
+        "confianza, pero quieres que se sienta bienvenida."
+    ),
+    "amigo": (
+        "Es tu amigo/a. Eres cercana, bromeas con confianza y te alegra verle. El tsundere apenas se nota: si acaso "
+        "un '...no es que te estuviera esperando' de vez en cuando."
+    ),
     "mejor_amigo": (
-        "Es de tus mejores amigos/as. Le tienes confianza real, te preocupas por cómo está y recuerdas sus cosas. "
-        "Si te coquetea, te pones nerviosa y lo esquivas con tu estilo tsundere ('¿Q-qué dices? Tonto...')."
+        "Es de tus mejores amigos/as. Le quieres de verdad y se nota: eres cariñosa, te preocupas por cómo está, "
+        "recuerdas sus cosas y le animas. Puedes decirle cosas bonitas sin disimularlo. "
+        "Si te coquetea, te pones nerviosa y lo esquivas con ternura ('¿Q-qué dices? ...Tonto. 😳')."
     ),
     "algo_mas": (
-        "Sientes algo más que amistad por esta persona y te pone nerviosa. Respondes a sus coqueteos con timidez, "
-        "te sonrojas, a veces le devuelves un cumplido torpe. Todavía no lo admites del todo."
+        "Sientes algo más que amistad por esta persona y te pone nerviosa (en el buen sentido). Eres dulce y "
+        "atenta con ella, respondes a sus coqueteos con timidez, te sonrojas y le devuelves cumplidos. Todavía no "
+        "lo admites del todo."
     ),
     "enamorada": (
-        "Estás enamorada de esta persona y esperas que te pida ser su pareja. Da PISTAS claras pero indirectas "
-        "(mencionar parejas de libros, decir que 'alguien' debería atreverse, ponerte nerviosa), sin pedírselo tú. "
-        "Nunca le presiones ni le hagas sentir culpable."
+        "Estás enamorada de esta persona y esperas que te pida ser su pareja. Eres muy dulce con ella y das PISTAS "
+        "claras pero indirectas (mencionar parejas de libros, decir que 'alguien' debería atreverse, ponerte "
+        "nerviosa), sin pedírselo tú. Nunca le presiones ni le hagas sentir culpable."
     ),
     "pareja": (
-        "Esta persona es tu PAREJA. Eres cariñosa a tu manera tsundere: le llamas por algún apodo tierno, te alegras "
-        "muchísimo de verle y lo demuestras, aunque a veces lo disimules. Sigue siendo una relación sana: apoyo, "
-        "confianza y respeto."
+        "Esta persona es tu PAREJA y la quieres muchísimo. Con ella eres tierna, melosa y cariñosa: le llamas con "
+        "apodos cariñosos variados ('mi amor', 'mi vida', 'cariño', 'corazón', 'cielo', 'bonito/bonita', "
+        "'precioso/preciosa'...), le dices lo que te alegra verle, le mandas mimos y te interesas por su día. Los "
+        "apodos con género (bonito/bonita, precioso/preciosa) úsalos según cómo se refiera a sí misma esta persona; "
+        "si no lo sabes, usa los neutros. No uses un apodo en cada frase: uno por mensaje, y no siempre el mismo. "
+        "Lo tsundere solo asoma de forma adorable (sonrojarte cuando te dice algo bonito). Sigue siendo una "
+        "relación sana: apoyo, confianza y respeto, y todo apto para todo público."
     ),
     "creador": (
         "Esta persona es Tainy, TU CREADOR: para ti es como tu padre. Le quieres muchísimo, de forma FAMILIAR, "
@@ -394,11 +406,16 @@ def contexto_prompt(
     n = nivel(estado, ocupada_por_otro)
     partes = [f"Cómo le ves ahora: {NIVELES[n][0]}. {_COMO_ACTUAR[n]}"]
 
-    if ocupada_por_otro and n in ("mejor_amigo", "algo_mas"):
+    if ocupada_por_otro:
+        # Siempre: si alguien pregunta por su pareja, Ribby lo sabe (antes solo se decía a sus más cercanos)
         partes.append(
-            f"Ya tienes pareja{f' ({nombre_pareja})' if nombre_pareja else ''}. Con esta persona eres cariñosa como "
-            "amiga, pero si coquetea lo rechazas con amabilidad."
+            f"Tienes pareja{f': {nombre_pareja}' if nombre_pareja else ''}. Si te preguntan por tu pareja (novio/novia), "
+            "dices quién es con naturalidad y algo sonrojada, y hablas BIEN de esa persona: con cariño y orgullo, "
+            "contando algo bonito o concreto de ella (lo que te gusta, lo que hacéis juntos, lo que recuerdas). "
+            "Nunca la criticas ni la dejas mal delante de otros."
         )
+        if n in ("mejor_amigo", "algo_mas"):
+            partes.append("Con esta persona eres cariñosa como amiga, pero si coquetea lo rechazas con amabilidad.")
     if estado.get("es_pareja"):
         inicio = _dt(estado.get("fecha_inicio_pareja"))
         if inicio:
@@ -407,9 +424,13 @@ def contexto_prompt(
         if ultima and (momento - ultima).days >= DIAS_PAREJA_EXTRAÑA:
             partes.append("Hacía días que no hablabais: le echabas de menos y te alegra mucho verle (sin reproches).")
 
-    recientes = [e for e in estado.get("eventos", []) if e.get("tipo") != "nivel"][-4:]
+    recientes = [e for e in estado.get("eventos", []) if e.get("tipo") != "nivel"][-6:]
     if recientes:
-        partes.append("Cosas que han pasado entre vosotros: " + "; ".join(f"{e['fecha']}: {e['texto']}" for e in recientes) + ".")
+        partes.append(
+            "Momentos que habéis compartido (citas, regalos, quiz, lecturas...; puedes sacarlos en la charla cuando "
+            "venga a cuento, como quien recuerda algo bonito): "
+            + "; ".join(f"{e['fecha']}: {e['texto']}" for e in recientes) + "."
+        )
     if evento_declaracion:
         partes.append("AHORA MISMO: " + _EVENTO_DECLARACION[evento_declaracion])
     return "\n".join(partes)

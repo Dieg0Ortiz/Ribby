@@ -35,7 +35,8 @@ TABLAS_BOT = [
     "eventos", "narraciones", "participantes", "asistencia_voz", "votos", "habilitados_voto",
     "descargas_documentos", "documentos_participantes", "ribby_memoria", "biblioteca_historias",
     "biblioteca_etiquetas", "autores_wattpad", "afinidad_usuarios", "ribby_config", "cumpleanos", "resenas",
-    "misiones_lectura", "logros_usuarios", "ribby_capitulos", "seguimientos",
+    "misiones_lectura", "logros_usuarios", "ribby_capitulos", "seguimientos", "relaciones_usuarios",
+    "citas_ribby",
 ]
 _RE_TABLAS = re.compile(
     r"\b(FROM|JOIN|INTO|UPDATE)(\s+)(" + "|".join(sorted(TABLAS_BOT, key=len, reverse=True)) + r")\b",
@@ -379,6 +380,58 @@ _PASOS_ESQUEMA: list[tuple[str, str]] = [
         """,
     ),
     ("RLS seguimientos", "ALTER TABLE seguimientos ENABLE ROW LEVEL SECURITY"),
+    # ── Memoria estructurada de Ribby y relaciones entre usuarios ──
+    (
+        "tabla ribby_memoria",
+        """
+        CREATE TABLE IF NOT EXISTS ribby_memoria (
+            usuario_discord_id    TEXT PRIMARY KEY,
+            resumen               TEXT,
+            mood                  TEXT DEFAULT 'frio',
+            interacciones         INTEGER DEFAULT 0,
+            ultima_actualizacion  TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "columnas de memoria estructurada en ribby_memoria",
+        """
+        ALTER TABLE ribby_memoria
+            ADD COLUMN IF NOT EXISTS hechos     TEXT DEFAULT '[]',   -- JSON: datos concretos (memoria.py)
+            ADD COLUMN IF NOT EXISTS pendientes TEXT DEFAULT '[]'    -- JSON: cosas con fecha para preguntar
+        """,
+    ),
+    (
+        "tabla relaciones_usuarios",
+        """
+        CREATE TABLE IF NOT EXISTS relaciones_usuarios (
+            usuario_a      TEXT NOT NULL,               -- siempre usuario_a < usuario_b
+            usuario_b      TEXT NOT NULL,
+            interacciones  INTEGER NOT NULL DEFAULT 0,  -- respuestas y menciones entre ellos
+            ultima         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (usuario_a, usuario_b)
+        )
+        """,
+    ),
+    ("RLS relaciones_usuarios", "ALTER TABLE relaciones_usuarios ENABLE ROW LEVEL SECURITY"),
+    (
+        "tabla citas_ribby",
+        """
+        CREATE TABLE IF NOT EXISTS citas_ribby (
+            id                  SERIAL PRIMARY KEY,
+            usuario_discord_id  TEXT NOT NULL,
+            fecha               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            titulo              TEXT NOT NULL,
+            premisa             TEXT,
+            lugar               TEXT,                  -- ingrediente sorteado (para no repetirlo con esa persona)
+            recuerdo            TEXT,                  -- lo que Ribby guarda de la cita
+            desenlace           TEXT,                  -- perfecta | bonita | regular | desastre | a_medias
+            quimica             REAL
+        )
+        """,
+    ),
+    ("índice citas por usuario", "CREATE INDEX IF NOT EXISTS citas_ribby_usuario ON citas_ribby (usuario_discord_id, fecha DESC)"),
+    ("RLS citas_ribby", "ALTER TABLE citas_ribby ENABLE ROW LEVEL SECURITY"),
     (
         "una sola pareja de Ribby",
         "CREATE UNIQUE INDEX IF NOT EXISTS afinidad_una_sola_pareja ON afinidad_usuarios ((es_pareja)) WHERE es_pareja",
@@ -971,23 +1024,101 @@ async def guardar_memoria_usuario(
     resumen: str,
     mood: str,
     interacciones: int,
+    hechos: Optional[str] = None,
+    pendientes: Optional[str] = None,
 ) -> None:
-    """Crea o actualiza la memoria de un usuario (upsert)."""
+    """
+    Crea o actualiza la memoria de un usuario (upsert). `hechos` y `pendientes`
+    son JSON (ver memoria.py); si se pasan como None se conservan los que había.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO ribby_memoria (usuario_discord_id, resumen, mood, interacciones, ultima_actualizacion)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO ribby_memoria
+                (usuario_discord_id, resumen, mood, interacciones, ultima_actualizacion, hechos, pendientes)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6::text, '[]'), COALESCE($7::text, '[]'))
             ON CONFLICT (usuario_discord_id)
             DO UPDATE SET
                 resumen = EXCLUDED.resumen,
                 mood = EXCLUDED.mood,
                 interacciones = EXCLUDED.interacciones,
-                ultima_actualizacion = EXCLUDED.ultima_actualizacion
+                ultima_actualizacion = EXCLUDED.ultima_actualizacion,
+                hechos = CASE WHEN $6::text IS NULL THEN ribby_memoria.hechos ELSE EXCLUDED.hechos END,
+                pendientes = CASE WHEN $7::text IS NULL THEN ribby_memoria.pendientes ELSE EXCLUDED.pendientes END
             """,
             # ultima_actualizacion es timestamptz: asyncpg exige un datetime, no un string ISO
-            str(discord_id), resumen, mood, interacciones, _now(),
+            str(discord_id), resumen, mood, interacciones, _now(), hechos, pendientes,
         )
+
+
+async def guardar_hechos_pendientes(
+    pool: asyncpg.Pool, discord_id, hechos: Optional[str] = None, pendientes: Optional[str] = None
+) -> None:
+    """Actualiza solo los datos y/o pendientes (JSON) de la memoria de un usuario."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ribby_memoria (usuario_discord_id, hechos, pendientes)
+            VALUES ($1, COALESCE($2::text, '[]'), COALESCE($3::text, '[]'))
+            ON CONFLICT (usuario_discord_id) DO UPDATE SET
+                hechos = CASE WHEN $2::text IS NULL THEN ribby_memoria.hechos ELSE EXCLUDED.hechos END,
+                pendientes = CASE WHEN $3::text IS NULL THEN ribby_memoria.pendientes ELSE EXCLUDED.pendientes END
+            """,
+            str(discord_id), hechos, pendientes,
+        )
+
+
+async def olvidar_memoria_usuario(pool: asyncpg.Pool, discord_id) -> bool:
+    """Borra todo lo que Ribby recuerda de las charlas con un usuario (no toca su relación ni sus logros)."""
+    async with pool.acquire() as conn:
+        borrado = await conn.execute("DELETE FROM ribby_memoria WHERE usuario_discord_id = $1", str(discord_id))
+        await conn.execute(
+            "DELETE FROM relaciones_usuarios WHERE usuario_a = $1 OR usuario_b = $1", str(discord_id)
+        )
+        return borrado != "DELETE 0"
+
+
+async def memorias_con_pendientes(pool: asyncpg.Pool) -> list[Dict[str, Any]]:
+    """Usuarios con algún pendiente guardado (para que Ribby pregunte cómo les fue)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT usuario_discord_id, pendientes FROM ribby_memoria "
+            "WHERE pendientes IS NOT NULL AND pendientes NOT IN ('', '[]')"
+        )
+        return [dict(r) for r in rows]
+
+
+# ─────────────────────────── Relaciones entre usuarios ───────────────────────────
+
+async def sumar_relaciones(pool: asyncpg.Pool, pares: list[tuple[str, str, int]]) -> None:
+    """Suma interacciones (respuestas/menciones) entre parejas de usuarios. Cada par va ordenado (a < b)."""
+    if not pares:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO relaciones_usuarios (usuario_a, usuario_b, interacciones)
+            SELECT a, b, n FROM unnest($1::text[], $2::text[], $3::int[]) AS t(a, b, n)
+            ON CONFLICT (usuario_a, usuario_b) DO UPDATE SET
+                interacciones = relaciones_usuarios.interacciones + EXCLUDED.interacciones,
+                ultima = NOW()
+            """,
+            [p[0] for p in pares], [p[1] for p in pares], [p[2] for p in pares],
+        )
+
+
+async def relaciones_de(pool: asyncpg.Pool, discord_id, limite: int = 5) -> list[tuple[str, int]]:
+    """Con quién interactúa más un usuario: [(otro_id, interacciones)]."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT CASE WHEN usuario_a = $1 THEN usuario_b ELSE usuario_a END AS otro, interacciones
+            FROM relaciones_usuarios WHERE usuario_a = $1 OR usuario_b = $1
+            ORDER BY interacciones DESC, ultima DESC LIMIT $2
+            """,
+            str(discord_id), limite,
+        )
+        return [(r["otro"], int(r["interacciones"])) for r in rows]
 
 
 # ─────────────────────────── Biblioteca de recomendaciones ───────────────────────────
@@ -1560,3 +1691,78 @@ async def ids_wattpad_guardados(pool: asyncpg.Pool) -> list[str]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT wattpad_id FROM biblioteca_historias WHERE wattpad_id IS NOT NULL")
         return [r["wattpad_id"] for r in rows]
+
+
+# ─────────────────────────── Citas con Ribby ───────────────────────────
+
+async def guardar_cita(
+    pool: asyncpg.Pool, discord_id, titulo: str, premisa: str, lugar: str, recuerdo: str, desenlace: str, quimica: float,
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO citas_ribby (usuario_discord_id, titulo, premisa, lugar, recuerdo, desenlace, quimica) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            str(discord_id), titulo, premisa, lugar, recuerdo, desenlace, quimica,
+        )
+
+
+async def citas_de(pool: asyncpg.Pool, discord_id, limite: int = 6) -> list[Dict[str, Any]]:
+    """Últimas citas de un usuario con Ribby (para no repetirlas y para que las recuerde)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT titulo, premisa, lugar, recuerdo AS resumen, desenlace, fecha FROM citas_ribby "
+            "WHERE usuario_discord_id = $1 ORDER BY fecha DESC LIMIT $2",
+            str(discord_id), limite,
+        )
+        return [dict(r) for r in rows]
+
+
+async def premisas_recientes(pool: asyncpg.Pool, limite: int = 40) -> list[str]:
+    """Premisas de las últimas citas de todo el servidor: ninguna cita debe parecerse a otra."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT titulo, premisa FROM citas_ribby ORDER BY fecha DESC LIMIT $1", limite
+        )
+        return [f"{r['titulo']}: {r['premisa'] or ''}" for r in rows]
+
+
+async def mejores_amigos_ribby(pool: asyncpg.Pool, limite: int = 5) -> list[Dict[str, Any]]:
+    """Las personas a las que Ribby tiene más cariño (sin contar a su pareja), para contárselo a su creador."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM afinidad_usuarios WHERE NOT COALESCE(es_pareja, FALSE) AND corazones >= 15 "
+            "ORDER BY corazones DESC, total_interacciones DESC LIMIT $1",
+            limite,
+        )
+        return [_estado_desde_fila(r) for r in rows]
+
+
+async def secretos_descubiertos(pool: asyncpg.Pool) -> Dict[str, tuple[str, datetime]]:
+    """{logro de secreto: (quién lo descubrió primero, cuándo)} en todo el servidor."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT ON (logro) logro, usuario_discord_id, fecha FROM logros_usuarios "
+            "WHERE logro LIKE 'secreto\\_%' ORDER BY logro, fecha ASC"
+        )
+        return {r["logro"]: (r["usuario_discord_id"], r["fecha"]) for r in rows}
+
+
+async def borrar_resena(pool: asyncpg.Pool, historia_id: int, discord_id) -> Optional[Dict[str, Any]]:
+    """Borra la reseña de un usuario en una historia. Retorna la reseña borrada (o None si no había)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM resenas WHERE historia_id = $1 AND usuario_discord_id = $2 RETURNING *",
+            historia_id, str(discord_id),
+        )
+        return dict(row) if row else None
+
+
+async def resenas_de_usuario(pool: asyncpg.Pool, discord_id) -> list[Dict[str, Any]]:
+    """Reseñas escritas por un usuario (con el título de la historia), las más recientes primero."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT r.*, b.titulo FROM resenas r JOIN biblioteca_historias b ON b.id = r.historia_id "
+            "WHERE r.usuario_discord_id = $1 ORDER BY r.fecha DESC",
+            str(discord_id),
+        )
+        return [dict(r) for r in rows]

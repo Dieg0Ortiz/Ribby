@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import secretos
+
 # clave: (emoji, nombre, cómo se consigue, es_secreto)
 LOGROS: dict[str, tuple[str, str, str, bool]] = {
     "primera_charla": ("👋", "Hola, Ribby", "Habla con Ribby por primera vez", False),
@@ -35,6 +37,9 @@ LOGROS: dict[str, tuple[str, str, str, bool]] = {
     "escarabajo": ("🪲", "Entomólogo incomprendido", "Regálale a Ribby algo que odia", True),
     "rechazado": ("💔", "Lo intentaste", "Declárate a Ribby antes de tiempo", True),
 }
+
+# Un logro oculto por cada secreto de Ribby (secretos.py): se ven como "???" hasta descubrirlos
+LOGROS.update({s.logro: (s.emoji, s.nombre, s.descripcion, True) for s in secretos.SECRETOS})
 
 _ORDEN_NIVEL = ["desconocido", "amigo", "mejor_amigo", "algo_mas", "enamorada", "pareja"]
 

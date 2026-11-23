@@ -28,8 +28,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+import calidad
 import config
 import database
+import hugging_face
 import recomendador as rec
 import wattpad
 from ai_providers import ProviderManager
@@ -50,6 +52,33 @@ def _num(n: Optional[int]) -> str:
 def _fuente_aporte(usuario_id: int, historia: dict[str, Any]) -> str:
     """Lo que escribe el autor de la historia tiene prioridad sobre el resto."""
     return "autor" if str(usuario_id) == str(historia.get("autor_discord") or "") else "usuario"
+
+
+_VIGENCIA_MOSTRADAS = 3 * 60 * 60  # Segundos durante los que Ribby "tiene presentes" las tarjetas que mostró
+
+
+def _ficha_charla(h: dict[str, Any]) -> str:
+    """Una historia en pocas líneas para el prompt de la charla."""
+    datos = [f"«{h.get('titulo') or 'Sin título'}» de {h.get('autor_nombre') or 'autor desconocido'}"]
+    tags = [t for t in (h.get("tags") or []) if t not in _TAGS_OCULTOS][:12]
+    if tags:
+        datos.append("etiquetas: " + ", ".join(tags))
+    if h.get("partes"):
+        datos.append(f"{h['partes']} partes, {'terminada' if h.get('completada') else 'en curso'}")
+    if h.get("lecturas"):
+        datos.append(f"{h['lecturas']} lecturas en Wattpad")
+    if h.get("nota_media") is not None:
+        datos.append(f"nota de la comunidad {h['nota_media']}/5 ({h.get('num_resenas') or 0} reseñas)")
+    if h.get("evento_nombre"):
+        datos.append(f"participó en el reto «{h['evento_nombre']}»")
+    if h.get("madura"):
+        datos.append("marcada como +18")
+    desc = " ".join((h.get("descripcion") or "").split())
+    sinopsis = (desc[:600] + "…") if len(desc) > 600 else (desc or "(no tienes su sinopsis)")
+    return "- " + " | ".join(datos) + f"\n  Sinopsis: {sinopsis}"
+
+
+_MIN_PALABRAS_RESUMEN = 6
 
 
 def _separar(texto: str) -> list[str]:
@@ -177,6 +206,8 @@ class AyudaFichaView(discord.ui.View):
 
     async def _abrir_resumen(self, interaction: discord.Interaction):
         async def guardar(inter: discord.Interaction, texto: str):
+            if await self.cog.rechazar_texto(inter, texto, _MIN_PALABRAS_RESUMEN):
+                return
             ok = await database.guardar_descripcion(
                 self.cog.db, self.historia["id"], texto, _fuente_aporte(inter.user.id, self.historia)
             )
@@ -214,6 +245,8 @@ class ResenaModal(discord.ui.Modal):
         valor = str(self.nota.value).strip()
         if not valor.isdigit() or not 1 <= int(valor) <= 5:
             return await interaction.response.send_message("La puntuación tiene que ser un número del 1 al 5 🙄", ephemeral=True)
+        if await self.cog.rechazar_texto(interaction, str(self.texto.value)):
+            return
         await self.cog.publicar_resena(interaction, self.historia, int(valor), str(self.texto.value))
 
 
@@ -229,6 +262,8 @@ class PedirResumenView(discord.ui.View):
     @discord.ui.button(label="Escribir resumen", emoji="✍️", style=discord.ButtonStyle.primary)
     async def escribir(self, interaction: discord.Interaction, button: discord.ui.Button):
         async def guardar(inter: discord.Interaction, texto: str):
+            if await self.cog.rechazar_texto(inter, texto, _MIN_PALABRAS_RESUMEN):
+                return
             fuente = _fuente_aporte(inter.user.id, self.historia)
             ok = await database.guardar_descripcion(self.cog.db, self.historia["id"], texto, fuente)
             if not ok:
@@ -260,7 +295,8 @@ class Biblioteca(commands.Cog):
         self._cache_t: dict[bool, float] = {}
         self._lock_sync = asyncio.Lock()
         self._recientes: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=12))
-        self._ultimas_canal: dict[int, list[int]] = {}
+        # Canal → (instante, IDs) de las últimas historias mostradas, para poder hablar de ellas después
+        self._ultimas_canal: dict[int, tuple[float, list[int]]] = {}
         try:
             self.model: Optional[ProviderManager] = ProviderManager(config)
         except Exception as e:  # noqa: BLE001
@@ -466,6 +502,58 @@ class Biblioteca(commands.Cog):
         por_id = {h["id"]: h for h in catalogo}
         return mensaje, [por_id[i] for i in ids if i in por_id]
 
+    # ── Textos basura y trolls ──
+
+    async def rechazar_texto(
+        self, interaction: discord.Interaction, texto: str, minimo_palabras: int = calidad.MIN_PALABRAS,
+    ) -> bool:
+        """
+        Reseñas y resúmenes: si el texto es basura (repetido, sin palabras, solo
+        símbolos...) u ofensivo, se rechaza con un mensaje privado y se devuelve
+        True. Se le devuelve su texto para que no lo pierda si era de buena fe.
+        """
+        motivo = calidad.problema_texto(texto, minimo_palabras)
+        if motivo is None and hugging_face.activo():
+            toxicidad = await hugging_face.puntuar_toxicidad(texto[:1000])
+            if toxicidad is not None and toxicidad >= config.UMBRAL_TOXICIDAD:
+                motivo = "ofensivo"
+        if motivo is None:
+            return False
+        log.info(f"🚫 Texto rechazado de {interaction.user.display_name} ({motivo})")
+        copia = f"\n\n*Tu texto, por si quieres corregirlo:*\n```{texto[:900].replace('`', 'ʼ')}```" if motivo in ("corto", "ofensivo") else ""
+        await interaction.response.send_message(calidad.MENSAJES[motivo] + copia, ephemeral=True)
+        return True
+
+    # ── Contexto para la charla (lo usa cogs/saludos.py) ──
+
+    def recordar_mostradas(self, canal_id: int, historias: list[dict[str, Any]]) -> None:
+        if historias:
+            self._ultimas_canal[canal_id] = (monotonic(), [h["id"] for h in historias])
+
+    def ultimas_mostradas(self, canal_id: int, max_segundos: float = _VIGENCIA_MOSTRADAS) -> list[int]:
+        momento, ids = self._ultimas_canal.get(canal_id, (0.0, []))
+        return ids if monotonic() - momento <= max_segundos else []
+
+    async def contexto_charla(self, canal_id: int, texto: str) -> str:
+        """
+        Fichas de las historias de las que se está hablando: las que Ribby mostró
+        hace poco en el canal y la que se nombre en el mensaje. Así, a "¿qué me
+        cuentas de cada una?" responde con datos reales en lugar de negarlo.
+        """
+        catalogo = await self.catalogo()
+        por_id = {h["id"]: h for h in catalogo}
+        elegidas = [por_id[i] for i in self.ultimas_mostradas(canal_id) if i in por_id]
+        nombrada = rec.buscar_por_titulo(catalogo, texto, umbral=0.75) if texto else None
+        if nombrada and nombrada["id"] not in {h["id"] for h in elegidas}:
+            elegidas.insert(0, nombrada)
+        if not elegidas:
+            return ""
+        lineas = [_ficha_charla(h) for h in elegidas[:4]]
+        return (
+            "FICHAS DE LAS HISTORIAS DE LAS QUE SE ESTÁ HABLANDO (datos reales de tu biblioteca; si te preguntan "
+            "por ellas, usa esto y no inventes nada que no esté aquí):\n" + "\n".join(lineas)
+        )
+
     async def _ofrecer_ayuda(self, canal: discord.abc.Messageable, historias: list[dict[str, Any]]) -> None:
         """Si alguna historia recomendada tiene la ficha incompleta, pide ayuda para completarla."""
         for h in historias:
@@ -494,7 +582,7 @@ class Biblioteca(commands.Cog):
                 mensaje, historias = await self.recomendar(rec.extraer_consulta(texto), message.author.id)
                 embeds = await self.tarjetas(historias)
             await message.reply(mensaje, embeds=embeds, mention_author=False, allowed_mentions=_SIN_PING)
-            self._ultimas_canal[message.channel.id] = [h["id"] for h in historias]
+            self.recordar_mostradas(message.channel.id, historias)
             await self._ofrecer_ayuda(message.channel, historias)
             return True
         return False
@@ -540,7 +628,7 @@ class Biblioteca(commands.Cog):
         catalogo = await self.catalogo()
         historia = rec.buscar_por_titulo(catalogo, texto)
         if not historia:
-            ultimas = self._ultimas_canal.get(message.channel.id) or []
+            ultimas = self.ultimas_mostradas(message.channel.id)
             if len(ultimas) == 1:
                 historia = next((h for h in catalogo if h["id"] == ultimas[0]), None)
         if not historia:
@@ -604,7 +692,7 @@ class Biblioteca(commands.Cog):
         mensaje, historias = await self.recomendar(peticion or "", interaction.user.id)
         await interaction.followup.send(mensaje, embeds=await self.tarjetas(historias), allowed_mentions=_SIN_PING)
         if interaction.channel:
-            self._ultimas_canal[interaction.channel.id] = [h["id"] for h in historias]
+            self.recordar_mostradas(interaction.channel.id, historias)
             await self._ofrecer_ayuda(interaction.channel, historias)  # type: ignore[arg-type]
 
     @grupo.command(name="agregar", description="Añade una historia de Wattpad a la biblioteca")
@@ -662,6 +750,8 @@ class Biblioteca(commands.Cog):
             return await interaction.response.send_message("No encuentro esa historia en mis estantes 🤔", ephemeral=True)
 
         async def guardar(inter: discord.Interaction, texto: str):
+            if await self.rechazar_texto(inter, texto, _MIN_PALABRAS_RESUMEN):
+                return
             ok = await database.guardar_descripcion(self.db, h["id"], texto, _fuente_aporte(inter.user.id, h))
             self.invalidar()
             await inter.response.send_message(
@@ -682,6 +772,13 @@ class Biblioteca(commands.Cog):
         if str(interaction.user.id) == str(h.get("autor_discord") or ""):
             return await interaction.response.send_message(
                 "¿Reseñar tu propia historia? Buen intento. 😏", ephemeral=True
+            )
+        romance = self.bot.get_cog("Afinidad")
+        castigo = await romance.castigo_activo(interaction.user.id) if romance is not None else None  # type: ignore[attr-defined]
+        if castigo:
+            return await interaction.response.send_message(
+                f"Después de lo que hiciste, no. Hasta el {castigo['hasta_texto']} no escribes reseñas en mi biblioteca. 😤",
+                ephemeral=True,
             )
         await interaction.response.send_modal(ResenaModal(self, h))
 
@@ -704,10 +801,48 @@ class Biblioteca(commands.Cog):
         for r in resenas:
             embed.add_field(
                 name=f"{'⭐' * r['puntuacion']}  —  {r['usuario_nombre'] or 'Anónimo'}"[:256],
-                value=r["texto"][:400] + ("…" if len(r["texto"]) > 400 else ""),
+                value=md(r["texto"][:400]) + ("…" if len(r["texto"]) > 400 else ""),
                 inline=False,
             )
         await interaction.response.send_message(embed=embed)
+
+    @grupo.command(name="borrar_resena", description="Borra tu reseña de una historia (el staff puede borrar la de cualquiera)")
+    @app_commands.describe(
+        historia="Título de la historia",
+        usuario="(Solo staff) De quién es la reseña. Si no lo indicas, se borra la tuya",
+        castigar="(Solo staff) Además, castigar a esa persona (-50 corazones y Ribby enfadada 3 días)",
+    )
+    @app_commands.autocomplete(historia=autocompletar_historia)
+    async def cmd_borrar_resena(
+        self, interaction: discord.Interaction, historia: str, usuario: Optional[discord.User] = None,
+        castigar: bool = False,
+    ):
+        ajena = usuario is not None and usuario.id != interaction.user.id
+        if (ajena or castigar) and not es_admin(interaction):
+            return await interaction.response.send_message(
+                "⛔ Solo el staff puede borrar reseñas de otras personas o castigar.", ephemeral=True
+            )
+        h = await self._resolver(historia)
+        if not h:
+            return await interaction.response.send_message("No encuentro esa historia en mis estantes 🤔", ephemeral=True)
+        objetivo = usuario or interaction.user
+        borrada = await database.borrar_resena(self.db, h["id"], objetivo.id)
+        if borrada is None:
+            return await interaction.response.send_message(
+                f"{'Esa persona' if ajena else 'Tú'} no {'tiene' if ajena else 'tienes'} reseña en **{md(h['titulo'])}** 🤔",
+                ephemeral=True,
+            )
+        self.invalidar()
+        log.info(f"🗑️ {interaction.user.display_name} borró la reseña de {objetivo} en «{h['titulo']}»")
+        texto = f"🗑️ Reseña de **{md(objetivo.display_name)}** en **{md(h['titulo'])}** borrada."
+        if castigar:
+            romance = self.bot.get_cog("Afinidad")
+            if romance is not None:
+                await interaction.response.send_message(texto, ephemeral=True)
+                return await romance.aplicar_castigo(  # type: ignore[attr-defined]
+                    interaction, objetivo, motivo=f"escribió una reseña troll en «{h['titulo']}»",
+                )
+        await interaction.response.send_message(texto, ephemeral=True)
 
     async def publicar_resena(
         self, interaction: discord.Interaction, h: dict[str, Any], puntuacion: int, texto: str

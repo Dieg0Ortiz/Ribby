@@ -70,6 +70,7 @@ class Pruebas(commands.Cog):
         if saludos is not None:
             getattr(saludos, "_estado_usuarios", {}).clear()
             getattr(saludos, "_ultimo_uso_ia", {}).clear()
+            getattr(saludos, "_cache_config", {}).clear()
         biblioteca = self.bot.get_cog("Biblioteca")
         if biblioteca is not None:
             biblioteca.invalidar(todo=True)  # type: ignore[attr-defined]
@@ -119,6 +120,13 @@ class Pruebas(commands.Cog):
             ),
             color=COLOR_PRUEBAS,
         )
+        if interaction.guild_id in config.GUILDS_PRUEBAS:
+            embed.add_field(
+                name="⚠️ Ojo",
+                value="Lo has activado desde el servidor de pruebas, pero el modo global afecta **también a La Comarca**. "
+                      "Aquí no hacía falta: este servidor ya usa siempre la base de pruebas.",
+                inline=False,
+            )
         embed.add_field(
             name="Para el staff",
             value="La biblioteca de pruebas empieza vacía: `/prueba sembrar`.\n"
@@ -142,11 +150,18 @@ class Pruebas(commands.Cog):
         comun.activar_modo_global(False)
         comun.eventos_forzados.clear()
         self._limpiar_caches()
+        descripcion = (
+            "Ribby vuelve a la normalidad: todo lo que hagáis desde ahora **cuenta de verdad**.\n"
+            "*(Los datos de prueba se conservan para la próxima vez, o se borran con `/prueba reiniciar`.)*"
+        )
+        if interaction.guild_id in config.GUILDS_PRUEBAS:
+            # Si no, parece que el modo no se desactivó: aquí Ribby sigue marcando todo con 🧪
+            descripcion += (
+                "\n\n🧪 **Ojo:** este es el **servidor de pruebas**, así que *aquí* Ribby sigue usando siempre la "
+                "base de pruebas (y marcando sus respuestas con 🧪). Lo que vuelve a la normalidad es La Comarca."
+            )
         await interaction.response.send_message(embed=discord.Embed(
-            title="✅  Modo de pruebas DESACTIVADO",
-            description="Ribby vuelve a la normalidad: todo lo que hagáis desde ahora **cuenta de verdad**.\n"
-                        "*(Los datos de prueba se conservan para la próxima vez, o se borran con `/prueba reiniciar`.)*",
-            color=config.COLOR_EXITO,
+            title="✅  Modo de pruebas DESACTIVADO", description=descripcion, color=config.COLOR_EXITO,
         ))
 
     @grupo.command(name="estado", description="¿Está Ribby en modo de pruebas?")

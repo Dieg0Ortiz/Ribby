@@ -63,6 +63,10 @@ Ribby no es un robot frío; está programada para reaccionar de forma orgánica 
 - Si alguien la etiqueta y la saluda (Ej: "Hola @Ribby"), responderá con saludos aleatorios y amables, indicando cuántos libros lleva guardados en su base de datos.
 - Si alguien la menciona y dice una palabra grosera relacionada con libros (Ej: "Odio los libros"), Ribby se pondrá a la defensiva (modo protector) y regañará al usuario por hablar mal de su preciada biblioteca.
 - Si simplemente la mencionan, dará respuestas genéricas de bibliotecaria, sugiriendo hacer silencio para leer o preguntando si buscan algún género en particular.
+- **Sigue la conversación del canal:** ve los últimos mensajes de todos (y lo que ella dijo o mostró), así que puede hablar con varias personas, retomar lo que dijo otro y recordar lo que acaba de recomendar.
+- **Cuándo responde:** cuando la mencionas, cuando respondes a uno de sus mensajes (aunque sea sin @), a veces cuando dicen su nombre y, de vez en cuando, cuando se habla de libros en su canal.
+- **Recomienda en plena charla:** si se nota que alguien busca algo para leer, muestra tarjetas de su biblioteca.
+- **Memoria de largo plazo:** recuerda datos concretos de cada persona y cosas con fecha ("mañana tengo examen") para preguntar después cómo fue. `/ribby recordar` añade un dato, `/ribby recuerdos` los muestra y `/ribby olvidar` borra uno o todos.
 
 ---
 
@@ -97,7 +101,7 @@ Cuanto más hablas con Ribby, más te conoce: recuerda lo que le cuentas y cómo
 - **Solo una:** Ribby solo puede tener una pareja en todo el servidor. Si ya tiene, tendrás que esperar.
 - **Todo es tierno y apto para todo público.** Ribby corta en seco cualquier cosa fuera de tono.
 
-**Comandos:** `/ribby corazones` (cómo te ve, solo lo ves tú), `/ribby recuerdos` (lo que recuerda de ti), `/ribby regalar` (un regalo al día), `/ribby cita` (una cita al día, con decisiones que importan) y `/ribby terminar` (si sois pareja).
+**Comandos:** `/ribby corazones` (cómo te ve, solo lo ves tú), `/ribby recuerdos` (lo que recuerda de ti), `/ribby regalar` (un regalo al día), `/ribby cita` (una cita al día: una aventura única de varias escenas escrita para ti, con decisiones nada obvias, retos y giros) y `/ribby terminar` (si sois pareja).
 
 ### Más cosas para hacer con Ribby
 - **📖 Misiones de lectura** (`/ribby mision`): Ribby te encarga una historia de su biblioteca, elegida según tus gustos. Léela y cuéntale qué te pareció con `/biblioteca resenar`: ganarás corazones y el autor recibirá tu reseña. Si no te convence, puedes pedir otra (una vez al día).
@@ -106,6 +110,8 @@ Cuanto más hablas con Ribby, más te conoce: recuerda lo que le cuentas y cómo
 - **💞 Aniversarios:** si eres la pareja de Ribby, ella celebrará cada mes juntos.
 - **🎉 Eventos de temporada** (`/ribby evento`): San Valentín, Día del Libro, Halloween / Día de Muertos y Navidad traen un regalo y una cita especiales.
 - **🏅 Logros** (`/ribby logros`): insignias por rachas, citas, lecturas... y algún logro secreto.
+- **🗝️ Secretos** (`/ribby secretos`): frases y acciones escondidas que hacen reaccionar a Ribby de forma especial. Pistas y progreso de la comunidad en el comando.
+- **🤫 Confidencias**: cuanta más confianza, más cosas íntimas te cuenta Ribby (quedan en `/ribby recuerdos`).
 - **📕 La historia de Ribby** (`/ribby historia`): capítulos sobre su pasado que solo cuenta a quien se gana su confianza. Se desbloquean al ser su amigo, su mejor amigo, algo más... y su pareja. Cada capítulo termina con una decisión que Ribby recordará.
 - **🧠 ¿Me conoces?** (`/ribby quiz`): una pregunta al día sobre Ribby (¡o sobre lo que tú le contaste!). Acertar da corazones; las preguntas sobre su pasado solo salen si has leído su historia.
 - **💌 Ribby te escribe:** si eres de sus mejores amigos o su pareja, de vez en cuando te saludará por su cuenta. Si prefieres que no, usa `/ribby avisos activar:False`.
@@ -136,7 +142,9 @@ Cuanto más hablas con Ribby, más te conoce: recuerda lo que le cuentas y cómo
 11. `/biblioteca autor [usuario]`: Perfil de autor con sus historias, lecturas, votos y reseñas.
 12. `/biblioteca seguir` / `/biblioteca dejar_de_seguir`: Avisos de capítulos nuevos.
 
-**Solo Staff:** `/biblioteca eliminar [historia]` y `/biblioteca sincronizar [lista]` (actualiza desde Wattpad o importa otra lista de lectura).
+13. `/biblioteca borrar_resena [historia]`: Borra tu reseña de una historia.
+
+**Solo Staff:** `/biblioteca borrar_resena [historia] [usuario] [castigar]` (borra reseñas troll de cualquiera), `/ribby castigar` y `/ribby perdonar`, `/biblioteca eliminar [historia]` y `/biblioteca sincronizar [lista]` (actualiza desde Wattpad o importa otra lista de lectura).
 
 ---
 Con Ribby al mando, los líderes del servidor pueden despreocuparse de las hojas de Excel, conteo de votos manuales y desorganización. Ribby es justa, exacta, interactiva y asegura que los retos literarios sean profesionales y divertidos.

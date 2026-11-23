@@ -57,8 +57,10 @@ GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 
 # Creador de Ribby (Tainy): Ribby le trata como a su padre. IDs de Discord separados por comas.
-# Si se deja vacío, se le reconoce por su nombre de usuario (ver comun.CREADOR_USUARIOS).
-CREADOR_IDS: list[int] = [int(x) for x in os.getenv("CREADOR_DISCORD_ID", "").replace(" ", "").split(",") if x.isdigit()]
+# Solo por ID: los nombres de usuario de Discord se pueden cambiar y reutilizar.
+CREADOR_IDS: list[int] = [
+    int(x) for x in os.getenv("CREADOR_DISCORD_ID", "641420040045985803").replace(" ", "").split(",") if x.isdigit()
+]
 
 # Listas de lectura de Wattpad que forman la base de la biblioteca (IDs separados por comas).
 # Por defecto: "Historias de nuestro servidor" de La Comarca.

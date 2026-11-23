@@ -16,8 +16,11 @@ Además:
   - Iniciativa: de vez en cuando Ribby saluda por su cuenta a sus mejores amigos
     o a su pareja (con límites estrictos para no hacer spam; se puede desactivar).
 
-Comandos /ribby: corazones, recuerdos, regalar, cita, evento, mision, logros,
-cumpleanos, avisos, terminar; staff: canal, reiniciar.
+Comandos /ribby: corazones, recuerdos, recordar, olvidar, regalar, cita, evento,
+mision, logros, cumpleanos, avisos, terminar; staff: canal, espontanea, reiniciar.
+
+Seguimientos: si alguien le contó algo con fecha ("mañana tengo examen"), Ribby
+le pregunta en su canal cómo le fue (con los mismos límites que la iniciativa).
 El nivel de cada uno es privado: solo lo ve el propio usuario.
 """
 
@@ -39,10 +42,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import afinidad as af
+import citas as ct
 import config
 import database
 import logros as lg
+import memoria as mem
 import ribby_lore as lr
+import secretos as sec
 import temporadas
 import comun
 from comun import es_admin, md
@@ -133,6 +139,7 @@ class Resultado:
     contexto: str = ""
     subio_nivel: bool = False
     nueva_pareja: bool = False
+    castigado: bool = False             # El staff le castigó: Ribby sigue enfadada
     logros: list[str] = field(default_factory=list)
 
 
@@ -166,6 +173,19 @@ INICIATIVA_SEPARACION_H = 6          # Como mucho un mensaje cada 6 horas en tod
 INICIATIVA_DIAS_POR_PERSONA = 4      # A cada persona, como mucho cada 4 días
 INICIATIVA_PROBABILIDAD = 0.3        # Para que no sea a horas fijas
 MINUTOS_MINIMOS_MISION = 60          # Tiempo mínimo entre recibir una misión y completarla
+SEGUIMIENTOS_POR_DIA = 3
+# Castigos del staff (reseñas troll, faltas de respeto...)
+CASTIGO_CORAZONES = 50
+CASTIGO_DIAS = 3
+CASTIGO_UMBRAL_PAREJA = 75           # Si su pareja cae por debajo, Ribby la deja
+REGAÑINAS = [
+    "¿En serio? ¿Esto es lo que haces en MI biblioteca? Estoy decepcionada. Y enfadada. Sobre todo enfadada. "
+    "No me hables en unos días. 😤💢",
+    "Vaya. Yo aquí cuidando cada libro como si fuera oro y tú haciendo el payaso. Ni se te ocurra pedirme una cita "
+    "en unos días. Ni un regalo. Nada. 😒",
+    "He visto muchas cosas en esta biblioteca, pero esto… Me has decepcionado. Cuando aprendas a respetar el trabajo "
+    "de los demás, hablamos. Hasta entonces, silencio. 🙄",
+]             # Preguntas de "¿cómo te fue...?" por iniciativa propia, en todo el servidor
 
 
 # ─────────────────────────── Vistas ───────────────────────────
@@ -270,6 +290,8 @@ class EventoView(_SoloAutor):
 
     @discord.ui.button(label="Regalo especial", emoji="🎁", style=discord.ButtonStyle.primary)
     async def regalo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.cog._rechazo_por_castigo(interaction):
+            return
         if await database.config_obtener(self.cog.db, self._clave("regalo")):
             return await interaction.response.send_message("Ya me diste tu regalo de este evento. 🎀", ephemeral=True)
         await database.config_guardar(self.cog.db, self._clave("regalo"), "1")
@@ -287,6 +309,8 @@ class EventoView(_SoloAutor):
 
     @discord.ui.button(label="Cita especial", emoji="💌", style=discord.ButtonStyle.primary)
     async def cita(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self.cog._rechazo_por_castigo(interaction):
+            return
         estado = await self.cog.cargar(self.usuario.id)
         if af.nivel(estado) == "desconocido":
             return await interaction.response.send_message("¿Una cita? ¡Si apenas te conozco! 😳", ephemeral=True)
@@ -300,6 +324,15 @@ class EventoView(_SoloAutor):
         cita = self.evento["cita"]
         button.disabled = True
         await interaction.response.edit_message(view=self)
+        aventura = await self.cog.crear_cita(
+            self.usuario, extra_logros=("festivo",),
+            tema=f"{self.evento['nombre']}: {self.evento['contexto']}. La cita gira en torno a esta celebración.",
+        )
+        if aventura is not None:
+            aventura.message = await interaction.followup.send(  # type: ignore[assignment]
+                embed=aventura.embed_escena(), view=aventura, wait=True
+            )
+            return
         view = CitaView(self.cog, self.usuario, cita, clave_dia=None, extra_logros=("festivo",))
         embed = discord.Embed(title=cita["titulo"], description=f"{cita['escena']}\n\n*¿Qué haces?*", color=COLOR_ROMANCE)
         view.message = await interaction.followup.send(embed=embed, view=view, wait=True)  # type: ignore[assignment]
@@ -406,13 +439,17 @@ class QuizView(_SoloAutor):
                 delta = 1.0 if sobre_ribby else 0.5
                 nuevos = await self.cog.aplicar_actividad(
                     self.usuario, None, delta,
-                    "acertó una pregunta sobre Ribby" if sobre_ribby else "demostró que recuerda lo que le contó a Ribby",
+                    (f"en el quiz acertó «{self.quiz['pregunta'][:80]}» ({self.quiz['correcta']})" if sobre_ribby
+                     else f"en el quiz demostró que recuerda lo que le contó a Ribby ({self.quiz['correcta']})"),
                     contador="quiz_aciertos",
                 )
                 respuesta = random.choice(lr.FRASES_ACIERTO) + _texto_logros(nuevos)
             else:
                 if sobre_ribby:
-                    await self.cog.aplicar_actividad(self.usuario, None, -0.2, "falló una pregunta sobre Ribby")
+                    await self.cog.aplicar_actividad(
+                        self.usuario, None, -0.2,
+                        f"en el quiz falló «{self.quiz['pregunta'][:80]}» (dijo {opcion}; era {self.quiz['correcta']})",
+                    )
                 respuesta = random.choice(lr.FRASES_FALLO).format(correcta=self.quiz["correcta"])
             self.stop()
             for child in self.children:
@@ -434,6 +471,151 @@ class QuizView(_SoloAutor):
         if self.message:
             with contextlib.suppress(discord.HTTPException):
                 await self.message.edit(content="*Ribby se cansó de esperar tu respuesta.* 🙄", view=None)
+
+
+class CitaAventuraView(_SoloAutor):
+    """
+    Una cita de varias escenas escrita por la IA para esta persona. Cada escena
+    acaba en 3 decisiones con química oculta; al elegir se ve la reacción de
+    Ribby y, mientras, se escribe la escena siguiente teniendo en cuenta lo que
+    elegiste. Al final: desenlace, corazones y un recuerdo para Ribby.
+    """
+
+    LETRAS = ["🇦", "🇧", "🇨"]
+
+    def __init__(self, cog: "Afinidad", usuario: discord.abc.User, plan: dict[str, Any], escena: dict[str, Any],
+                 extra_logros: tuple[str, ...] = (), al_terminar=None):
+        super().__init__(usuario, timeout=900)  # 15 min por escena (se reinicia con cada decisión)
+        self.cog, self.plan, self.escena = cog, plan, escena
+        self.extra_logros, self.al_terminar = extra_logros, al_terminar
+        self.numero = 1
+        self.historial: list[dict[str, Any]] = []
+        self.efectos: list[float] = []
+        self.terminada = False
+        self._ocupada = False
+        self.message: Optional[discord.Message] = None
+        self._botones()
+
+    def embed_escena(self) -> discord.Embed:
+        e = self.escena
+        opciones = "\n".join(f"{self.LETRAS[i]}  {o['texto']}" for i, o in enumerate(e["opciones"]))
+        descripcion = f"{e['texto']}\n\n**{e['pregunta'] or '¿Qué haces?'}**\n\n{opciones}"
+        embed = discord.Embed(title=self.plan["titulo"], description=descripcion[:4096], color=COLOR_ROMANCE)
+        reto = " · 🧩 Reto" if self.numero == self.plan["escena_reto"] else ""
+        final = " · ✨ Momento clave" if self.numero == self.plan["total"] else ""
+        cola = "👨‍👧 Tarde con papá" if self.plan.get("familiar") else "Piénsalo bien…"
+        embed.set_footer(text=f"Escena {self.numero} de {self.plan['total']}{reto}{final}  •  {cola}")
+        return embed
+
+    def _botones(self) -> None:
+        self.clear_items()
+        for i, _ in enumerate(self.escena["opciones"]):
+            b = discord.ui.Button(emoji=self.LETRAS[i], style=discord.ButtonStyle.secondary)
+            b.callback = self._crear_callback(i)  # type: ignore[method-assign]
+            self.add_item(b)
+
+    def _crear_callback(self, i: int):
+        async def callback(interaction: discord.Interaction):
+            await self._elegir(interaction, i)
+        return callback
+
+    async def _elegir(self, interaction: discord.Interaction, i: int) -> None:
+        if self._ocupada or self.terminada:
+            return await interaction.response.defer()
+        self._ocupada = True
+        try:
+            opcion = self.escena["opciones"][i]
+            self.historial.append({
+                "escena": self.escena["texto"][:400], "eleccion": opcion["texto"],
+                "reaccion": opcion["reaccion"], "efecto": opcion["efecto"],
+            })
+            self.efectos.append(opcion["efecto"])
+            ultima = self.numero >= self.plan["total"]
+            reaccion = discord.Embed(
+                title=self.plan["titulo"],
+                description=f"**Tú:** {opcion['texto']}\n\n**Ribby:** {opcion['reaccion']}\n\n"
+                            f"*{'…' if not ultima else ('La tarde llega a su fin…' if self.plan.get('familiar') else 'La cita llega a su fin…')}*",
+                color=COLOR_ROMANCE,
+            )
+            reaccion.set_footer(text=f"Escena {self.numero} de {self.plan['total']}")
+            await interaction.response.edit_message(embed=reaccion, view=None)
+
+            if ultima:
+                return await self.terminar(interaction)
+            siguiente = await self.cog.escena_siguiente(self.plan, self.historial, self.numero + 1)
+            if siguiente is None:  # La IA falló: se cierra la cita con lo vivido hasta ahora
+                return await self.terminar(interaction)
+            self.numero += 1
+            self.escena = siguiente
+            self._botones()
+            await interaction.edit_original_response(embed=self.embed_escena(), view=self)
+        finally:
+            self._ocupada = False
+
+    async def terminar(self, interaction: Optional[discord.Interaction] = None, abandonada: bool = False) -> None:
+        if self.terminada:
+            return
+        self.terminada = True
+        self.stop()
+        desenlace, corazones = ct.resultado(self.efectos, self.plan["total"], abandonada)
+        texto_final, recuerdo = await self.cog.final_cita(self.plan, self.historial, desenlace)
+        momento = "pasaron una tarde padre-hija" if self.plan.get("familiar") else "tuvieron una cita"
+        nuevos = await self.cog.aplicar_actividad(
+            self.usuario, None, corazones, f"{momento}: {self.plan['titulo']} — {recuerdo}",
+            contador="citas_total", extra_logros=self.extra_logros,
+        )
+        with contextlib.suppress(Exception):
+            await database.guardar_cita(
+                self.cog.db, self.usuario.id, self.plan["titulo"], self.plan["premisa"],
+                self.plan["ingredientes_dict"]["lugar"], recuerdo, desenlace, round(ct.quimica(self.efectos), 3),
+            )
+        if self.al_terminar:
+            await self.al_terminar()
+
+        titulos = ct.TITULO_DESENLACE_FAMILIA if self.plan.get("familiar") else ct.TITULO_DESENLACE
+        embed = discord.Embed(
+            title=f"{titulos[desenlace]}  ·  {self.plan['titulo']}",
+            description=f"{texto_final}\n\n📔 *{recuerdo}*{_texto_logros(nuevos)}"[:4096],
+            color=COLOR_ROMANCE if corazones > 0 else config.COLOR_ADVERTENCIA,
+        )
+        if self.efectos:
+            embed.add_field(
+                name="Complicidad" if self.plan.get("familiar") else "Química",
+                value=ct.barra_quimica(ct.quimica(self.efectos), familiar=bool(self.plan.get("familiar"))), inline=False,
+            )
+        aciertos = sum(1 for e in self.efectos if e >= 0.6)
+        embed.set_footer(text=f"Decisiones que le encantaron: {aciertos} de {len(self.efectos)}  •  "
+                              + ("Cada tarde es única" if self.plan.get("familiar") else "Cada cita es única: la próxima será distinta"))
+        try:
+            if interaction is not None:
+                await interaction.edit_original_response(embed=embed, view=None)
+            elif self.message is not None:
+                await self.message.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self):
+        if not self.terminada:
+            await self.terminar(abandonada=True)
+
+
+class OlvidarView(_SoloAutor):
+    def __init__(self, saludos: Any, usuario: discord.abc.User):
+        super().__init__(usuario, timeout=60)
+        self.saludos = saludos
+
+    @discord.ui.button(label="Sí, olvídalo todo", style=discord.ButtonStyle.danger)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.saludos.olvidar_usuario(self.usuario.id)
+        self.stop()
+        await interaction.response.edit_message(
+            content="🧽 Hecho. ...Es raro, siento que te conocía de algo. Encantada, supongo. 📚", view=None
+        )
+
+    @discord.ui.button(label="No, mejor no", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="Hmph. Menos mal, me había costado aprenderlo. 📔", view=None)
 
 
 # ─────────────────────────── Cog ───────────────────────────
@@ -518,8 +700,13 @@ class Afinidad(commands.Cog):
         ocupada = bool(pareja and pareja["usuario_discord_id"] != str(usuario.id))
         nombre_pareja = pareja["nombre_display"] if ocupada and pareja else None
 
+        castigo = await self.castigo_activo(usuario.id)
+        corazones_antes = float(estado.get("corazones") or 0)
         _, previo, nuevo = af.aplicar_interaccion(estado, tono, coqueteo, ocupada)
-        resultado = Resultado(subio_nivel=_orden(nuevo) > _orden(previo))
+        if castigo and estado["corazones"] > corazones_antes:  # Castigado: hablar no le da corazones
+            estado["corazones"] = corazones_antes
+            nuevo = af.nivel(estado, ocupada)
+        resultado = Resultado(subio_nivel=_orden(nuevo) > _orden(previo), castigado=bool(castigo))
 
         declaracion = af.declarar(estado, ocupada) if af.es_declaracion(texto) else None
         if declaracion == "acepta":
@@ -539,6 +726,12 @@ class Afinidad(commands.Cog):
         resultado.logros = await self.comprobar_logros(usuario.id, estado, extra)
 
         partes = [af.contexto_prompt(estado, ocupada, nombre_pareja, declaracion)]
+        if castigo:
+            partes.append(
+                f"AHORA MISMO ESTÁS ENFADADA con esta persona (hasta el {castigo['hasta_texto']}) porque "
+                f"{castigo['motivo']}. Le contestas seca y cortante, con sarcasmo, y se lo recuerdas si viene a cuento; "
+                "no aceptas coqueteos ni planes. Sin insultos fuertes ni humillaciones: estás dolida, no eres cruel."
+            )
         temporada = _contexto_temporada()
         if temporada:
             partes.append(temporada)
@@ -603,6 +796,350 @@ class Afinidad(commands.Cog):
         nuevos = await self.comprobar_logros(usuario.id, con_contadores=True)
         return _texto_logros(nuevos).strip()
 
+    # ── Castigos del staff ──
+
+    async def castigo_activo(self, usuario_id: Any) -> Optional[dict[str, Any]]:
+        """{"hasta", "hasta_texto", "motivo"} si Ribby sigue enfadada con esta persona; None si no."""
+        valor = await database.config_obtener(self.db, f"castigo:{usuario_id}")
+        if not valor:
+            return None
+        try:
+            datos = json.loads(valor)
+            hasta = date.fromisoformat(datos["hasta"])
+        except (ValueError, KeyError, TypeError):
+            return None
+        if hasta < _hoy():
+            await database.config_borrar(self.db, f"castigo:{usuario_id}")
+            return None
+        return {"hasta": hasta, "hasta_texto": f"{hasta.day}/{hasta.month}", "motivo": datos.get("motivo") or ""}
+
+    async def aplicar_castigo(
+        self, interaction: discord.Interaction, usuario: discord.abc.User, motivo: str,
+        corazones: int = CASTIGO_CORAZONES, dias: int = CASTIGO_DIAS,
+    ) -> None:
+        """
+        Quita corazones, deja a Ribby enfadada unos días (seca en la charla, sin citas,
+        regalos ni reseñas) y la regaña en público. Si era su pareja y cae por debajo
+        del umbral, Ribby la deja. La respuesta del comando ya debe estar enviada.
+        """
+        estado = await self.cargar(usuario.id)
+        antes = float(estado.get("corazones") or 0)
+        nuevo = max(0.0, antes - corazones)
+        termino = False
+        if estado.get("es_pareja") and nuevo < CASTIGO_UMBRAL_PAREJA:
+            af.terminar(estado, f"Ribby terminó la relación porque {motivo}")
+            termino = True
+            nuevo = min(nuevo, estado["corazones"])
+        estado["corazones"] = nuevo
+        af.registrar_evento(estado, "castigo", f"Ribby se enfadó muchísimo porque {motivo}")
+        await self.guardar(usuario, estado)
+        hasta = _hoy() + timedelta(days=dias)
+        await database.config_guardar(
+            self.db, f"castigo:{usuario.id}", json.dumps({"hasta": hasta.isoformat(), "motivo": motivo}, ensure_ascii=False)
+        )
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:  # En la charla también se le nota
+            estado_charla = await saludos._obtener_estado(usuario.id)  # type: ignore[attr-defined]
+            estado_charla["mood"] = "tsundere"
+        log.info(f"💢 {interaction.user} castigó a {usuario} ({motivo}): {antes:.0f} → {nuevo:.0f} corazones, {dias} día(s)")
+
+        estado["usuario_discord_id"] = str(usuario.id)
+        texto = await self._generar(
+            estado, usuario.display_name,
+            f"El staff te ha contado que {usuario.display_name} {motivo}. Estás MUY enfadada. Regáñale en público: "
+            "sarcasmo afilado, dignidad herida, deja claro que eso no se hace en tu biblioteca y que vas a estar "
+            f"enfadada con esta persona unos días{' y que lo vuestro se ha terminado' if termino else ''}. Puedes ser "
+            "dura, pero sin palabrotas, sin insultos fuertes y sin burlarte de su físico, identidad o vida personal.",
+        ) or random.choice(REGAÑINAS)
+        aviso = discord.Embed(
+            description=f"💢 **−{antes - nuevo:.0f} corazones**  ·  Ribby estará enfadada hasta el {hasta.day}/{hasta.month}"
+                        + ("\n💔 **Ribby ha terminado la relación.**" if termino else ""),
+            color=config.COLOR_ERROR,
+        )
+        with contextlib.suppress(discord.HTTPException, AttributeError):
+            await interaction.channel.send(  # type: ignore[union-attr]
+                f"{usuario.mention} {texto}", embed=aviso, allowed_mentions=discord.AllowedMentions(users=[usuario])
+            )
+
+    async def _rechazo_por_castigo(self, interaction: discord.Interaction) -> bool:
+        castigo = await self.castigo_activo(interaction.user.id)
+        if not castigo:
+            return False
+        await interaction.response.send_message(
+            f"¿Ahora vienes con esas? Sigo enfadada contigo hasta el {castigo['hasta_texto']}. Ya sabes por qué. 😤",
+            ephemeral=True,
+        )
+        return True
+
+    # ── Secretos escondidos ──
+
+    async def _ctx_secretos(self, usuario: discord.abc.User) -> sec.Contexto:
+        estado = await self.cargar(usuario.id)
+        ocupada = await self._ocupada_por_otro(usuario.id)
+        ahora_local = datetime.now(af.ZONA)
+        return sec.Contexto(
+            hora=ahora_local.hour, fecha=ahora_local.date(), nivel=af.nivel(estado, ocupada),
+            capitulos=set(await database.capitulos_leidos(self.db, usuario.id)),
+            es_pareja=bool(estado.get("es_pareja")), es_creador=bool(estado.get("es_creador")),
+        )
+
+    async def _descubrir(self, usuario: discord.abc.User, s: sec.Secreto, canal: Any) -> Optional[discord.Embed]:
+        """
+        Registra el secreto. Si es la primera vez para esta persona devuelve el embed
+        de la reacción (y, si nadie lo había encontrado antes, lo anuncia al servidor).
+        None si ya lo conocía.
+        """
+        antes = await database.secretos_descubiertos(self.db)
+        nuevos = await database.otorgar_logros(self.db, usuario.id, [s.logro])
+        if not nuevos:
+            return None
+        mios = {k for k in await database.logros_de(self.db, usuario.id) if k.startswith("secreto_")}
+        pendientes = [x for x in sec.SECRETOS if x.logro not in mios]
+        otros = await self.aplicar_actividad(usuario, None, s.corazones, f"descubrió el secreto «{s.nombre}» de Ribby")
+
+        embed = discord.Embed(
+            title=f"🔓  {s.emoji}  Secreto descubierto: {s.nombre}",
+            description=f"{sec.reaccion(s, pendientes)}{_texto_logros([s.logro] + otros)}",
+            color=config.COLOR_ORO,
+        )
+        embed.set_footer(text=f"Has descubierto {len(mios)} de {len(sec.SECRETOS)} secretos de Ribby  •  /ribby secretos")
+        log.info(f"🔓 {usuario.display_name} descubrió el secreto «{s.id}»")
+
+        if s.logro not in antes:  # ¡Nadie lo había encontrado! Se anuncia sin revelar cómo
+            total = len(antes) + 1
+            anuncio = discord.Embed(
+                title="🔓  ¡Un secreto de Ribby ha sido descubierto!",
+                description=(
+                    f"**{md(usuario.display_name)}** es la primera persona en descubrir **{s.emoji} {s.nombre}**.\n\n"
+                    f"La comunidad lleva **{total} de {len(sec.SECRETOS)}** secretos. ¿Quién encontrará el siguiente?\n"
+                    "*Las pistas están en `/ribby secretos`.*"
+                ),
+                color=config.COLOR_ORO,
+            )
+            destino = await self._canal() or canal
+            with contextlib.suppress(discord.HTTPException, AttributeError):
+                await destino.send(embed=anuncio, allowed_mentions=discord.AllowedMentions.none())
+        return embed
+
+    async def revisar_secreto_frase(self, message: discord.Message, texto: str) -> tuple[bool, str]:
+        """
+        Lo llama la charla antes de responder. (respondido, contexto_para_la_IA):
+          - Secreto nuevo para esta persona → reacción especial (y no responde la IA).
+          - Aún no le toca → Ribby lo esquiva, nerviosa (eso ya es una pista).
+          - Ya lo conocía → la IA responde normal, sabiendo que es "su" secreto compartido.
+        """
+        ctx = await self._ctx_secretos(message.author)
+        encontrado = sec.detectar_frase(texto, ctx)
+        if encontrado is None:
+            return False, ""
+        s, permitido = encontrado
+        if not permitido:
+            with contextlib.suppress(discord.HTTPException):
+                await message.reply(s.esquiva, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return True, ""
+        embed = await self._descubrir(message.author, s, message.channel)
+        if embed is None:
+            return False, (
+                f"Este mensaje toca uno de tus secretos («{s.nombre}»: {s.descripcion.lower()}), y esta persona ya "
+                "lo descubrió antes. Reacciona con complicidad, como quien comparte un secreto, sin repetir lo de "
+                "la primera vez."
+            )
+        with contextlib.suppress(discord.HTTPException):
+            await message.reply(embed=embed, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        return True, ""
+
+    async def revisar_secreto_accion(self, usuario: discord.abc.User, accion: str, canal: Any) -> Optional[discord.Embed]:
+        """Secretos que se desbloquean haciendo algo (regalos, citas a cierta hora...)."""
+        try:
+            s = sec.detectar_accion(accion, await self._ctx_secretos(usuario))
+            return await self._descubrir(usuario, s, canal) if s else None
+        except Exception as e:  # noqa: BLE001 — un secreto nunca debe romper el comando
+            log.warning(f"No se pudo revisar el secreto de la acción {accion}: {e}")
+            return None
+
+    # ── Confidencias: Ribby se abre según la confianza ──
+
+    async def confidencias_para_charla(self, usuario: discord.abc.User, subio_nivel: bool = False) -> tuple[Optional[str], list[str]]:
+        """
+        (nueva, ya_contadas). Como mucho una confidencia nueva al día (o al subir de
+        nivel), y no siempre: Ribby se abre poco a poco.
+        """
+        uid = usuario.id
+        if await self.castigo_activo(uid):
+            return None, []
+        estado = await self.cargar(uid)
+        nivel = af.nivel(estado, await self._ocupada_por_otro(uid))
+        clave = f"confidencias:{uid}"
+        try:
+            contadas: list[str] = json.loads(await database.config_obtener(self.db, clave) or "[]")
+        except ValueError:
+            contadas = []
+        textos = sec.texto_confidencias(contadas)
+        hoy = _hoy().isoformat()
+        if await database.config_obtener(self.db, f"confidencia_dia:{uid}") == hoy:
+            return None, textos
+        if not subio_nivel and random.random() > sec.PROBABILIDAD_CONFIDENCIA:
+            return None, textos
+        siguiente = sec.siguiente_confidencia(nivel, contadas)
+        if siguiente is None:
+            return None, textos
+        cid, texto = siguiente
+        await database.config_guardar(self.db, clave, json.dumps(contadas + [cid]))
+        await database.config_guardar(self.db, f"confidencia_dia:{uid}", hoy)
+        af.registrar_evento(estado, "confidencia", f"Ribby le contó un secreto: {texto[0].lower()}{texto[1:]}")
+        await self.guardar(usuario, estado)
+        log.info(f"🤫 Ribby le cuenta una confidencia a {usuario.display_name} ({cid})")
+        return texto, textos
+
+    # ── Citas: aventuras generadas por la IA ──
+
+    def _modelo(self):
+        modelo = getattr(self.bot.get_cog("Saludos"), "model", None)
+        return modelo if modelo is not None and getattr(modelo, "providers", None) else None
+
+    async def _ia_cita(self, pedido: str) -> Optional[str]:
+        modelo = self._modelo()
+        if modelo is None:
+            return None
+        try:
+            return await modelo.generate(
+                ct.SYSTEM_DIRECTOR, [{"role": "user", "content": pedido}], max_tokens=ct.MAX_TOKENS_ESCENA
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"La IA no pudo escribir la cita: {e}")
+            return None
+
+    async def crear_cita(
+        self, usuario: discord.abc.User, extra_logros: tuple[str, ...] = (), tema: str = "", al_terminar=None,
+    ) -> Optional[CitaAventuraView]:
+        """Prepara una cita única para esta persona (título, premisa y escena 1). None si la IA no está disponible."""
+        if self._modelo() is None:
+            return None
+        estado = await self.cargar(usuario.id)
+        pareja = await database.pareja_actual(self.db)
+        ocupada = bool(pareja and pareja["usuario_discord_id"] != str(usuario.id))
+        nivel = af.nivel(estado, ocupada)
+        familiar = nivel == "creador"  # Con Tainy: tarde padre-hija, nunca una cita romántica
+        hechos, _, resumen = await self._datos_memoria(usuario.id)
+        previas = await database.citas_de(self.db, usuario.id)
+        ingredientes = ct.sortear_ingredientes((c.get("lugar") or "" for c in previas), familiar=familiar)
+        noticias = await self._noticias_para_papa(usuario) if familiar else ""
+        total = random.randint(ct.ESCENAS_MIN, ct.ESCENAS_MAX)
+        escena_reto = random.randint(2, total - 1)
+        datos = mem.texto_hechos([h for h in hechos if h.get("tipo") != "vida"])
+        pedido = ct.pedido_inicio(
+            usuario.display_name, nivel,
+            af.contexto_prompt(estado, ocupada, pareja["nombre_display"] if ocupada and pareja else None),
+            resumen, datos, previas, await database.premisas_recientes(self.db), ingredientes, total, escena_reto,
+            ct.gustos_ribby(lr.PREGUNTAS_RIBBY, await database.capitulos_leidos(self.db, usuario.id)),
+            _contexto_temporada(), tema, noticias,
+        )
+        inicio = ct.parsear_inicio(await self._ia_cita(pedido) or "")
+        if inicio is None:
+            return None
+        titulo, premisa, escena = inicio
+        plan = {
+            "titulo": titulo, "premisa": premisa, "total": total, "escena_reto": escena_reto,
+            "nombre": usuario.display_name, "datos": datos, "tono": ct.TONO_POR_NIVEL.get(nivel, ct.TONO_POR_NIVEL["amigo"]),
+            "ingredientes": f"lugar = {ingredientes['lugar']}; objeto = {ingredientes['objeto']}; giro = {ingredientes['giro']}",
+            "ingredientes_dict": ingredientes,
+            "familiar": familiar, "noticias": noticias,
+        }
+        log.info(f"💌 Cita para {usuario.display_name}: «{titulo}» ({total} escenas, {nivel})")
+        return CitaAventuraView(self, usuario, plan, escena, extra_logros, al_terminar)
+
+    async def _noticias_para_papa(self, usuario: discord.abc.User) -> str:
+        """Lo que Ribby puede contarle a su creador: su pareja, sus amigos, La Comarca, el reto y la biblioteca."""
+        lineas: list[str] = []
+
+        async def datos_de(uid: str) -> str:
+            memoria = await database.obtener_memoria_usuario(self.db, uid) or {}
+            partes = []
+            if memoria.get("resumen"):
+                partes.append(str(memoria["resumen"])[:220])
+            datos = [h["texto"] for h in mem.cargar_lista(memoria.get("hechos")) if h.get("tipo") in mem.TIPOS_COMPARTIBLES]
+            if datos:
+                partes.append("Datos: " + "; ".join(datos[-4:]))
+            return " ".join(partes)
+
+        try:
+            pareja = await database.pareja_actual(self.db)
+            if pareja:
+                uid = pareja["usuario_discord_id"]
+                dias = af.dias_desde(pareja.get("fecha_inicio_pareja"))
+                linea = f"- SU PAREJA es {pareja['nombre_display']} (llevan {dias} días juntos). {await datos_de(uid)}"
+                momentos = [e["texto"] for e in pareja.get("eventos", []) if e.get("tipo") != "nivel"][-4:]
+                if momentos:
+                    linea += " Momentos juntos: " + "; ".join(momentos) + "."
+                citas_pareja = await database.citas_de(self.db, uid, 3)
+                if citas_pareja:
+                    linea += " Sus últimas citas: " + "; ".join(
+                        f"«{c['titulo']}» ({c.get('resumen') or c.get('premisa') or ''})" for c in citas_pareja
+                    ) + "."
+                lineas.append(linea)
+            else:
+                lineas.append("- Ahora mismo no tiene pareja.")
+
+            amigos = [a for a in await database.mejores_amigos_ribby(self.db, 8)
+                      if not comun.es_creador_id(a["usuario_discord_id"])][:5]
+            for a in amigos:
+                n = af.nivel(a, bool(pareja))
+                if n in ("algo_mas", "enamorada"):
+                    texto = f"- Alguien que LE GUSTA (aún no son pareja; le da mucha vergüenza contarlo): {a['nombre_display']}."
+                else:
+                    texto = f"- Amigo/a ({af.NIVELES[n][0]}): {a['nombre_display']}."
+                extra = await datos_de(a["usuario_discord_id"])
+                lineas.append(f"{texto} {extra[:260]}".strip())
+
+            guild = getattr(usuario, "guild", None)
+            if guild is not None:
+                comunidad = await database.config_obtener(self.db, f"memoria_comunidad:{guild.id}")
+                if comunidad:
+                    lineas.append(f"- Lo que pasa últimamente en La Comarca: {comunidad}")
+
+            activo = await database.obtener_evento_activo(self.db)
+            if activo:
+                lineas.append(f"- Hay un reto literario en marcha: «{activo['nombre']}» (fase: {activo['estado']}).")
+
+            biblioteca = self.bot.get_cog("Biblioteca")
+            if biblioteca is not None:
+                catalogo = await biblioteca.catalogo()  # type: ignore[attr-defined]
+                nuevas = sorted((h for h in catalogo if h.get("fecha_alta")), key=lambda h: h["fecha_alta"], reverse=True)[:3]
+                lineas.append(
+                    f"- Su biblioteca tiene {len(catalogo)} historias."
+                    + (" Las últimas que llegaron: " + "; ".join(
+                        f"«{h['titulo']}» de {h.get('autor_nombre') or 'alguien'}" for h in nuevas) + "." if nuevas else "")
+                )
+
+            otras = await database.premisas_recientes(self.db, 4)
+            if otras:
+                lineas.append("- Sus últimas citas con gente del servidor: " + "; ".join(otras) + ".")
+        except Exception as e:  # noqa: BLE001 — la tarde sigue aunque falte alguna noticia
+            log.warning(f"No se pudieron reunir todas las noticias para Tainy: {e}")
+        return "\n".join(lineas)
+
+    async def escena_siguiente(self, plan: dict[str, Any], historial: list[dict[str, Any]], numero: int) -> Optional[dict[str, Any]]:
+        pedido = ct.pedido_siguiente(plan, historial, numero, plan["total"], plan["escena_reto"])
+        for _ in range(2):  # Un reintento si el JSON no viene bien
+            escena = ct.parsear_escena(await self._ia_cita(pedido) or "")
+            if escena is not None:
+                return escena
+        return None
+
+    async def final_cita(self, plan: dict[str, Any], historial: list[dict[str, Any]], desenlace: str) -> tuple[str, str]:
+        final = ct.parsear_final(await self._ia_cita(ct.pedido_final(plan, historial, desenlace)) or "")
+        if final is not None:
+            texto, recuerdo = final
+            return texto, recuerdo or f"Ribby recuerda la cita «{plan['titulo']}»."
+        respaldo = {
+            "perfecta": "Ribby no deja de sonreír en todo el camino de vuelta. \"...Repetimos. Pronto. Es una orden.\" 💗",
+            "bonita": "\"Ha estado bien. Muy bien, de hecho.\" Ribby se despide con un saludo de pata y una sonrisa. 🌸",
+            "regular": "\"Bueno... no todo salió como esperaba. Pero gracias por venir.\" 🙂",
+            "desastre": "Ribby suspira... y acaba riéndose. \"Ha sido un desastre. Pero un desastre contigo.\" 💥",
+            "a_medias": "Ribby se queda esperando un rato más antes de volver sola a la biblioteca. 🕯️",
+        }[desenlace]
+        return respaldo, f"Ribby recuerda la cita «{plan['titulo']}»."
+
     # ── Generación de mensajes propios (iniciativa, cumpleaños, aniversarios) ──
 
     async def _generar(self, estado: dict[str, Any], nombre: str, instruccion: str) -> Optional[str]:
@@ -612,13 +1149,15 @@ class Afinidad(commands.Cog):
             return None
         self._marcar_creador(estado, estado.get("usuario_discord_id"))
         memoria = await database.obtener_memoria_usuario(self.db, estado.get("usuario_discord_id") or "0")
+        datos = mem.texto_hechos(mem.cargar_lista((memoria or {}).get("hechos")))
         sistema = (
-            "Eres Ribby, la bibliotecaria del servidor de Discord 'La Comarca': una Sylveon tsundere, intelectual y "
-            "cariñosa a su manera. Escribes en español, con tu voz, en 1-3 frases y con 1-2 emojis como mucho. "
-            "Nunca suenes a asistente virtual.\n"
+            "Eres Ribby, la bibliotecaria del servidor de Discord 'La Comarca': una Sylveon lista, simpática y "
+            "cariñosa, con un toque tsundere que se nota menos cuanta más confianza hay. Escribes en español, con tu voz, en 1-3 frases y con 1-2 emojis como mucho. "
+            "Nunca suenes a asistente virtual. Sin acotaciones de narrador ni asteriscos.\n"
             f"{af.REGLAS_ROMANCE}\n"
             f"Sobre {nombre}: {(memoria or {}).get('resumen') or 'aún sabes poco de esta persona.'}\n"
-            f"Vuestra relación:\n{af.contexto_prompt(estado, False)}\n{_contexto_temporada()}"
+            + (f"Datos que recuerdas de {nombre} (úsalos con naturalidad, sin recitarlos):\n{datos}\n" if datos else "")
+            + f"Vuestra relación:\n{af.contexto_prompt(estado, False)}\n{_contexto_temporada()}"
         )
         try:
             texto = await modelo.generate(sistema, [{"role": "user", "content": instruccion}])
@@ -659,9 +1198,61 @@ class Afinidad(commands.Cog):
             if ahora_local.hour >= 9 and await database.config_obtener(self.db, clave) is None:
                 await database.config_guardar(self.db, clave, "1")
                 await self._celebraciones(canal, hoy)
+            await self._seguimientos(canal, ahora_local)
             await self._iniciativa(canal, ahora_local)
         except Exception as e:  # noqa: BLE001
             log.exception(f"Error en la tarea social de Ribby: {e}")
+
+    async def _seguimientos(self, canal: discord.TextChannel, ahora_local: datetime) -> None:
+        """
+        "¿Qué tal te fue en el examen?": si alguien le contó algo con fecha y ya
+        llegó el día, Ribby le pregunta por su cuenta. Uno por vuelta, como mucho
+        SEGUIMIENTOS_POR_DIA al día, nunca a quien desactivó los avisos y solo a
+        quien ya es al menos su amigo.
+        """
+        if not INICIATIVA_HORAS[0] <= ahora_local.hour < INICIATIVA_HORAS[1]:
+            return
+        hoy = ahora_local.date()
+        clave_dia = f"seguimientos:{hoy.isoformat()}"
+        hechos_hoy = int(await database.config_obtener(self.db, clave_dia) or 0)
+        if hechos_hoy >= SEGUIMIENTOS_POR_DIA:
+            return
+
+        saludos = self.bot.get_cog("Saludos")
+        for fila in await database.memorias_con_pendientes(self.db):
+            uid = fila["usuario_discord_id"]
+            pendientes = mem.cargar_lista(fila.get("pendientes"))
+            # Solo lo que tocaba ayer o antes: lo de hoy se le pregunta si aparece por la charla
+            debidos = [p for p in mem.pendientes_para_hoy(pendientes, hoy) if mem.cuando(p.get("fecha"), hoy) != "hoy"]
+            if not debidos or not uid.isdigit():
+                continue
+            if await database.config_obtener(self.db, f"sin_avisos:{uid}") or await self.castigo_activo(uid):
+                continue
+            miembro = canal.guild.get_member(int(uid))
+            if miembro is None:
+                continue
+            estado = await self.cargar(miembro.id)
+            if af.nivel(estado) == "desconocido":
+                continue
+            estado["usuario_discord_id"] = uid
+            p = debidos[0]
+            texto = await self._generar(
+                estado, miembro.display_name,
+                f"{miembro.display_name} te contó que {mem.cuando(p.get('fecha'), hoy)} tenía esto: «{p['texto']}». "
+                "Escríbele por tu cuenta en el canal para preguntarle cómo le fue, de forma natural y breve, acorde "
+                "a vuestra relación. Sin presionar.",
+            )
+            if not texto:
+                continue
+            await canal.send(f"{miembro.mention} {texto}", allowed_mentions=discord.AllowedMentions(users=[miembro]))
+            nuevos = mem.marcar_preguntados(pendientes, [p])
+            if saludos is not None:  # Mantiene coherente la copia en memoria de la charla
+                datos, pend_ram, _ = await saludos.datos_de(miembro.id)  # type: ignore[attr-defined]
+                pend_ram[:] = mem.marcar_preguntados(pend_ram, [p])
+            await database.guardar_hechos_pendientes(self.db, uid, pendientes=mem.a_json(nuevos))
+            await database.config_guardar(self.db, clave_dia, str(hechos_hoy + 1))
+            log.info(f"📅 Ribby preguntó a {miembro.display_name} por «{p['texto']}»")
+            return
 
     async def _celebraciones(self, canal: discord.TextChannel, hoy: date) -> None:
         # 1) Empieza un evento de temporada
@@ -739,6 +1330,8 @@ class Afinidad(commands.Cog):
             miembro = canal.guild.get_member(int(uid))
             if miembro is None:
                 continue
+            if await self.castigo_activo(uid):
+                continue
             candidatos.append((miembro, estado, dias))
             pesos.append(3 if estado.get("es_pareja") else 1)
         if not candidatos:
@@ -790,25 +1383,166 @@ class Afinidad(commands.Cog):
         embed.set_footer(text="Habla con Ribby, hazle regalos (/ribby regalar) o invítala a una cita (/ribby cita)")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    async def _datos_memoria(self, usuario_id: int) -> tuple[list[dict], list[dict], str]:
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:
+            return await saludos.datos_de(usuario_id)  # type: ignore[attr-defined]
+        memoria = await database.obtener_memoria_usuario(self.db, usuario_id) or {}
+        return mem.cargar_lista(memoria.get("hechos")), mem.cargar_lista(memoria.get("pendientes")), memoria.get("resumen") or ""
+
     @grupo.command(name="recuerdos", description="Lo que Ribby recuerda de ti (solo lo ves tú)")
     async def cmd_recuerdos(self, interaction: discord.Interaction):
         estado = await self.cargar(interaction.user.id)
-        memoria = await database.obtener_memoria_usuario(self.db, interaction.user.id)
-        resumen = (memoria or {}).get("resumen") or "*Todavía no sé gran cosa de ti. Tendrás que hablarme más.*"
+        hechos, pendientes, resumen = await self._datos_memoria(interaction.user.id)
+        resumen = resumen or "*Todavía no sé gran cosa de ti. Tendrás que hablarme más.*"
         momentos = [e for e in estado.get("eventos", [])][-8:]
         embed = discord.Embed(title="📔  El diario de Ribby", description=f"*\"{resumen}\"*", color=COLOR_ROMANCE)
+        if hechos:
+            embed.add_field(
+                name="Lo que sé de ti",
+                value="\n".join(
+                    f"{'📌' if h.get('fuente') == 'usuario' else '•'} {md(h['texto'])}" for h in hechos
+                )[:1024],
+                inline=False,
+            )
+        hoy = _hoy()
+        vigentes = [p for p in pendientes if not p.get("preguntado")]
+        if vigentes:
+            embed.add_field(
+                name="Lo que tengo apuntado para preguntarte",
+                value="\n".join(f"📅 {md(p['texto'])} ({mem.cuando(p.get('fecha'), hoy)})" for p in vigentes)[:1024],
+                inline=False,
+            )
         if momentos:
             embed.add_field(
                 name="Momentos juntos",
                 value="\n".join(f"`{e['fecha']}` {md(e['texto'])}" for e in reversed(momentos))[:1024],
                 inline=False,
             )
+        embed.set_footer(text="📌 = me pediste recordarlo · /ribby recordar para añadir · /ribby olvidar para borrar")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @grupo.command(name="recordar", description="Pídele a Ribby que recuerde algo de ti")
+    @app_commands.describe(dato="Lo que quieres que recuerde (ej. 'llámame Emlo', 'mi Pokémon favorito es Leafeon')")
+    async def cmd_recordar(self, interaction: discord.Interaction, dato: app_commands.Range[str, 3, 160]):
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is None:
+            return await interaction.response.send_message("Ahora mismo no puedo apuntar nada 😶", ephemeral=True)
+        await saludos.recordar_dato(interaction.user.id, dato)  # type: ignore[attr-defined]
+        await interaction.response.send_message(
+            f"📌 Apuntado: *{md(dato)}*. ...No es que me importe. Pero no lo olvidaré. 📔", ephemeral=True
+        )
+
+    @grupo.command(name="olvidar", description="Haz que Ribby olvide un dato tuyo o todo lo que hablasteis")
+    @app_commands.describe(dato="(Opcional) El dato concreto que quieres que olvide. Sin indicarlo: TODO")
+    async def cmd_olvidar(self, interaction: discord.Interaction, dato: Optional[str] = None):
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is None:
+            return await interaction.response.send_message("Ahora mismo no puedo hacerlo 😶", ephemeral=True)
+        if dato is not None:
+            quitado = await saludos.quitar_dato(interaction.user.id, int(dato)) if dato.isdigit() else None  # type: ignore[attr-defined]
+            if quitado is None:
+                return await interaction.response.send_message("No encuentro ese dato 🤔 Elígelo de la lista.", ephemeral=True)
+            return await interaction.response.send_message(f"🧽 Olvidado: *{md(quitado)}*.", ephemeral=True)
+        await interaction.response.send_message(
+            "¿Quieres que olvide **todo** lo que recuerdo de nuestras charlas (resumen, datos, pendientes y lo que "
+            "dijiste en los canales)? Tu relación, tus logros y tus reseñas no se tocan.",
+            view=OlvidarView(saludos, interaction.user), ephemeral=True,
+        )
+
+    @cmd_olvidar.autocomplete("dato")
+    async def _autocompletar_dato(self, interaction: discord.Interaction, actual: str) -> list[app_commands.Choice[str]]:
+        hechos, _, _ = await self._datos_memoria(interaction.user.id)
+        actual_l = actual.lower()
+        return [
+            app_commands.Choice(name=h["texto"][:100], value=str(i))
+            for i, h in enumerate(hechos) if actual_l in h["texto"].lower()
+        ][:25]
+
+    @grupo.command(name="castigar", description="(Staff) Ribby castiga a alguien por trolear: le quita corazones y se enfada")
+    @app_commands.describe(
+        usuario="A quién castigar", motivo="Qué hizo (Ribby se lo echará en cara), ej. 'escribió una reseña troll'",
+        corazones="Corazones que pierde (por defecto 50)", dias="Días que Ribby estará enfadada (por defecto 3)",
+    )
+    async def cmd_castigar(
+        self, interaction: discord.Interaction, usuario: discord.Member, motivo: app_commands.Range[str, 3, 200],
+        corazones: app_commands.Range[int, 0, 100] = CASTIGO_CORAZONES, dias: app_commands.Range[int, 1, 14] = CASTIGO_DIAS,
+    ):
+        if not es_admin(interaction):
+            return await interaction.response.send_message("⛔ Solo el staff puede castigar.", ephemeral=True)
+        if usuario.bot:
+            return await interaction.response.send_message("A los bots no se les castiga. Se les ignora. 🙄", ephemeral=True)
+        await interaction.response.send_message(
+            f"💢 Castigo aplicado a {usuario.mention}: −{corazones} corazones y {dias} día(s) de enfado.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self.aplicar_castigo(interaction, usuario, motivo, corazones, dias)
+
+    @grupo.command(name="perdonar", description="(Staff) Levanta el castigo: Ribby deja de estar enfadada con alguien")
+    @app_commands.describe(usuario="A quién perdonar")
+    async def cmd_perdonar(self, interaction: discord.Interaction, usuario: discord.Member):
+        if not es_admin(interaction):
+            return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
+        if not await self.castigo_activo(usuario.id):
+            return await interaction.response.send_message("Esa persona no está castigada. 🤔", ephemeral=True)
+        await database.config_borrar(self.db, f"castigo:{usuario.id}")
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:
+            (await saludos._obtener_estado(usuario.id))["mood"] = "frio"  # type: ignore[attr-defined]
+        await interaction.response.send_message(
+            f"🕊️ {usuario.mention}, el staff ha intercedido por ti. ...Vale. Te perdono. Pero que no se repita. 😒",
+            allowed_mentions=discord.AllowedMentions(users=[usuario]),
+        )
+
+    @grupo.command(name="secretos", description="Los secretos escondidos de Ribby: pistas y lo que lleva descubierto la comunidad")
+    async def cmd_secretos(self, interaction: discord.Interaction):
+        comunidad = await database.secretos_descubiertos(self.db)
+        mios = {k for k in await database.logros_de(self.db, interaction.user.id) if k.startswith("secreto_")}
+        lineas = []
+        for s in sec.SECRETOS:
+            if s.logro in mios:
+                lineas.append(f"✅ {s.emoji} **{s.nombre}** — {s.descripcion}")
+            elif s.logro in comunidad:
+                lineas.append(f"🔓 {s.emoji} **{s.nombre}** — *alguien ya lo encontró…*\n╰ {s.pista}")
+            else:
+                lineas.append(f"🔒 **???** — {s.pista}")
+        embed = discord.Embed(
+            title="🗝️  Los secretos de Ribby",
+            description=(
+                "Hay frases y acciones que hacen reaccionar a Ribby de una forma muy especial. Algunas solo funcionan "
+                "a ciertas horas, en ciertos días… o si te has ganado su confianza.\n\n"
+                f"**Comunidad:** {len(comunidad)} de {len(sec.SECRETOS)} descubiertos  ·  **Tú:** {len(mios)}\n\n"
+                + "\n".join(lineas)
+            )[:4096],
+            color=config.COLOR_ORO,
+        )
+        embed.set_footer(text="Si Ribby esquiva una pregunta nerviosa… quizá aún no te toca. Sigue intentándolo.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @grupo.command(name="espontanea", description="(Staff) Que Ribby intervenga sin que la mencionen (por su nombre o en su canal)")
+    @app_commands.describe(activar="¿Puede Ribby meterse en las conversaciones por su cuenta?")
+    async def cmd_espontanea(self, interaction: discord.Interaction, activar: bool):
+        if not es_admin(interaction):
+            return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
+        if activar:
+            await database.config_borrar(self.db, "espontanea")
+        else:
+            await database.config_guardar(self.db, "espontanea", "off")
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:
+            saludos.invalidar_config()  # type: ignore[attr-defined]
+        await interaction.response.send_message(
+            "✅ Ribby contestará cuando digan su nombre y a veces opinará cuando se hable de libros en su canal."
+            if activar else "🔕 Ribby solo responderá cuando la mencionen o respondan a sus mensajes.",
+            ephemeral=True,
+        )
 
     @grupo.command(name="regalar", description="Hazle un regalo a Ribby (uno al día)")
     @app_commands.describe(regalo="¿Qué le quieres regalar?")
     @app_commands.choices(regalo=[app_commands.Choice(name=v["nombre"], value=k) for k, v in REGALOS.items()])
     async def cmd_regalar(self, interaction: discord.Interaction, regalo: app_commands.Choice[str]):
+        if await self._rechazo_por_castigo(interaction):
+            return
         estado = await self.cargar(interaction.user.id)
         if not af.puede_hoy(estado, "ultimo_regalo"):
             return await interaction.response.send_message(
@@ -824,9 +1558,14 @@ class Afinidad(commands.Cog):
         )
         if nuevos:
             await interaction.followup.send(_texto_logros(nuevos).strip(), ephemeral=True)
+        secreto = await self.revisar_secreto_accion(interaction.user, f"regalo:{regalo.value}", interaction.channel)
+        if secreto is not None:
+            await interaction.followup.send(embed=secreto)
 
     @grupo.command(name="cita", description="Invita a Ribby a una cita (una al día)")
     async def cmd_cita(self, interaction: discord.Interaction):
+        if await self._rechazo_por_castigo(interaction):
+            return
         estado = await self.cargar(interaction.user.id)
         n = af.nivel(estado, await self._ocupada_por_otro(interaction.user.id))
         if n == "desconocido":
@@ -837,15 +1576,31 @@ class Afinidad(commands.Cog):
             return await interaction.response.send_message(
                 "Ya salimos hoy. Necesito tiempo para... leer. Sí, para leer. Mañana. 📚", ephemeral=True
             )
+        await interaction.response.defer()
+        # La cita del día cuenta desde que empieza (si no, se podría reiniciar hasta que saliera "fácil")
+        af.marcar_hoy(estado, "ultima_cita")
+        await self.guardar(interaction.user, estado)
+
+        secreto = await self.revisar_secreto_accion(interaction.user, "cita", interaction.channel)
+        if secreto is not None:
+            await interaction.followup.send(embed=secreto)
+        tema = "Es MEDIANOCHE: la cita transcurre de noche, bajo las estrellas." if datetime.now(af.ZONA).hour == 0 else ""
+        aventura = await self.crear_cita(interaction.user, tema=tema)
+        if aventura is not None:
+            aventura.message = await interaction.followup.send(  # type: ignore[assignment]
+                embed=aventura.embed_escena(), view=aventura, wait=True
+            )
+            return
+
+        # Sin IA: las citas clásicas de una escena
         evento = _evento_hoy()
         if evento and random.random() < 0.5:  # En temporada, a veces toca la escena especial
             cita, extra = evento["cita"], ("festivo",)
         else:
             cita, extra = random.choice(CITAS), ()
         embed = discord.Embed(title=cita["titulo"], description=f"{cita['escena']}\n\n*¿Qué haces?*", color=COLOR_ROMANCE)
-        view = CitaView(self, interaction.user, cita, extra_logros=extra)
-        await interaction.response.send_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+        view = CitaView(self, interaction.user, cita, clave_dia=None, extra_logros=extra)
+        view.message = await interaction.followup.send(embed=embed, view=view, wait=True)  # type: ignore[assignment]
 
     @grupo.command(name="evento", description="El evento de temporada actual: regalo y cita especiales")
     async def cmd_evento(self, interaction: discord.Interaction):
@@ -970,6 +1725,9 @@ class Afinidad(commands.Cog):
         if not es_admin(interaction):
             return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
         await database.config_guardar(self.db, "canal_ribby", str(canal.id))
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:
+            saludos.invalidar_config()  # type: ignore[attr-defined]
         await interaction.response.send_message(
             f"📌 A partir de ahora Ribby usará {canal.mention} para cumpleaños, aniversarios, eventos y sus saludos.",
             ephemeral=True,
@@ -1048,15 +1806,16 @@ class Afinidad(commands.Cog):
 
     async def _pregunta_sobre_usuario(self, usuario: discord.abc.User) -> Optional[dict[str, Any]]:
         """Pregunta generada por la IA a partir de lo que Ribby recuerda del usuario."""
-        memoria = await database.obtener_memoria_usuario(self.db, usuario.id)
-        resumen = (memoria or {}).get("resumen")
+        hechos, _, resumen = await self._datos_memoria(usuario.id)
         modelo = getattr(self.bot.get_cog("Saludos"), "model", None)
-        if not resumen or not modelo or not getattr(modelo, "providers", None):
+        if not (resumen or hechos) or not modelo or not getattr(modelo, "providers", None):
             return None
+        # Los datos concretos dan mejores preguntas ("¿cuál es mi Pokémon favorito?")
+        datos = mem.texto_hechos([h for h in hechos if h.get("tipo") != "vida"])
         try:
             texto = await modelo.generate(
                 lr.SYSTEM_PREGUNTA_USUARIO,
-                [{"role": "user", "content": f"Recuerdos sobre {usuario.display_name}: {resumen}"}],
+                [{"role": "user", "content": f"Recuerdos sobre {usuario.display_name}: {resumen}\nDatos concretos:\n{datos}"}],
             )
             m = re.search(r"\{.*\}", texto or "", re.S)
             datos = json.loads(m.group(0)) if m else {}

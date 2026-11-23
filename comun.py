@@ -53,7 +53,6 @@ def marcar_usuario(usuario: Any, servidor_id: Optional[int] = None) -> None:
     tanto qué base de datos usar). Acepta un usuario de Discord o un ID.
     """
     if usuario is not None and not isinstance(usuario, int):
-        es_creador(usuario)  # Recuerda el ID del creador si se le reconoce por su nombre
         if servidor_id is None and getattr(usuario, "guild", None) is not None:
             servidor_id = usuario.guild.id
         usuario = usuario.id
@@ -106,21 +105,14 @@ def instalar_contexto(bot: discord.Client) -> None:
 
 # ─────────────────────────── El creador de Ribby ───────────────────────────
 
-# Tainy: Ribby le ve como su padre/creador. Se reconoce por ID (CREADOR_DISCORD_ID)
-# o, si no está configurado, por su nombre de usuario de Discord.
-CREADOR_USUARIOS = {"peso_pluma__."}
+# Tainy: Ribby le ve como su padre/creador. Se reconoce SOLO por su ID de Discord
+# (config.CREADOR_IDS). Antes también por nombre de usuario, pero un nombre se puede
+# cambiar y otra persona podría quedárselo y obtener los permisos del creador.
 _creadores: set[int] = set(config.CREADOR_IDS)
 
 
 def es_creador(usuario: Any) -> bool:
-    if usuario is None:
-        return False
-    if getattr(usuario, "id", None) in _creadores:
-        return True
-    if str(getattr(usuario, "name", "")).lower() in CREADOR_USUARIOS:
-        _creadores.add(usuario.id)  # Se recuerda el ID para tareas que solo conocen el número
-        return True
-    return False
+    return usuario is not None and getattr(usuario, "id", None) in _creadores
 
 
 def es_creador_id(usuario_id: Any) -> bool:

@@ -5,12 +5,17 @@ Orden: Claude → Hugging Face → Groq (Gemini y OpenRouter al final, si tienen
 Solo se usan los que tengan su API key configurada.
 Todos reciben el mismo formato: un system prompt y un historial
 [{"role": "user" | "ribby", "content": str}, ...].
+
+El system prompt puede ser un texto o una lista de partes [fija, variable, ...]:
+con Claude la primera parte se marca para el prompt caching (se cobra ~10 % al
+reutilizarla); el resto de proveedores reciben las partes unidas.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from typing import Optional, Sequence, Union
 
 import aiohttp
 import anthropic
@@ -25,12 +30,24 @@ MAX_TOKENS_SALIDA = 500
 TIMEOUT_HTTP = aiohttp.ClientTimeout(total=30)
 
 
+SystemPrompt = Union[str, Sequence[str]]
+
+
+def unir_system(system_prompt: SystemPrompt) -> str:
+    """El system prompt como un solo texto (para los proveedores sin caché por bloques)."""
+    if isinstance(system_prompt, str):
+        return system_prompt
+    return "\n\n".join(p for p in system_prompt if p)
+
+
 class AIProvider:
     """Clase base para todos los proveedores de IA."""
 
     nombre = "AIProvider"
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+    async def generate(
+        self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
+    ) -> str:
         raise NotImplementedError
 
 
@@ -51,7 +68,25 @@ class ClaudeProvider(AIProvider):
         # no responde rápido, es mejor pasar al siguiente proveedor.
         self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=30.0, max_retries=1)
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+    @staticmethod
+    def _system(system_prompt: SystemPrompt):
+        """
+        Una lista de partes se envía como bloques y la primera (la fija: identidad,
+        reglas...) lleva cache_control. Solo se reutiliza si es idéntica byte a
+        byte, así que nada variable (nombres, fechas, mood) debe ir en ella.
+        """
+        if isinstance(system_prompt, str):
+            return system_prompt
+        partes = [p for p in system_prompt if p]
+        if not partes:
+            return ""
+        bloques: list[dict] = [{"type": "text", "text": partes[0], "cache_control": {"type": "ephemeral"}}]
+        bloques += [{"type": "text", "text": p} for p in partes[1:]]
+        return bloques
+
+    async def generate(
+        self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
+    ) -> str:
         messages = [
             {"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
             for m in chat_history
@@ -62,8 +97,8 @@ class ClaudeProvider(AIProvider):
         try:
             resp = await self._client.messages.create(
                 model=self.model_name,
-                max_tokens=MAX_TOKENS_SALIDA,
-                system=system_prompt,
+                max_tokens=max_tokens or MAX_TOKENS_SALIDA,
+                system=self._system(system_prompt),
                 messages=messages,
                 # Sin razonamiento interno y esfuerzo bajo: respuestas cortas de chat,
                 # los tokens se gastan solo en el texto que ve el usuario.
@@ -84,6 +119,14 @@ class ClaudeProvider(AIProvider):
         if resp.stop_reason == "refusal":
             raise RuntimeError("Claude rechazó responder a este mensaje")
 
+        uso = getattr(resp, "usage", None)
+        if uso is not None:
+            log.debug(
+                f"Claude: {uso.input_tokens} tokens de entrada, "
+                f"{getattr(uso, 'cache_read_input_tokens', 0) or 0} leídos de caché, "
+                f"{getattr(uso, 'cache_creation_input_tokens', 0) or 0} escritos en caché"
+            )
+
         texto = "".join(b.text for b in resp.content if b.type == "text").strip()
         if not texto:
             raise RuntimeError("Respuesta vacía de Claude")
@@ -99,7 +142,10 @@ class GeminiProvider(AIProvider):
         self.current_key_idx = 0
         self._clientes = [genai.Client(api_key=k) for k in api_keys]
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+    async def generate(
+        self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
+    ) -> str:
+        system_prompt = unir_system(system_prompt)
         if not self.api_keys:
             raise RuntimeError("No hay llaves de Gemini configuradas.")
 
@@ -112,7 +158,7 @@ class GeminiProvider(AIProvider):
 
         cfg = types.GenerateContentConfig(
             system_instruction=system_prompt,
-            max_output_tokens=MAX_TOKENS_SALIDA,
+            max_output_tokens=max_tokens or MAX_TOKENS_SALIDA,
             temperature=0.8,
             # Sin "thinking": respuestas cortas y rápidas, y no consume el límite de salida
             thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -150,7 +196,10 @@ class OpenAICompatibleProvider(AIProvider):
         self.url = url
         self.extra_headers = extra_headers or {}
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+    async def generate(
+        self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
+    ) -> str:
+        system_prompt = unir_system(system_prompt)
         if not self.api_key:
             raise RuntimeError(f"No hay llave de {self.nombre} configurada.")
 
@@ -162,7 +211,7 @@ class OpenAICompatibleProvider(AIProvider):
         payload = {
             "model": self.model_name,
             "messages": messages,
-            "max_tokens": MAX_TOKENS_SALIDA,
+            "max_tokens": max_tokens or MAX_TOKENS_SALIDA,
             "temperature": 0.7,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", **self.extra_headers}
@@ -213,7 +262,9 @@ class ProviderManager:
 
         log.info(f"ProviderManager inicializado con {len(self.providers)} proveedor(es) de IA.")
 
-    async def generate(self, system_prompt: str, chat_history: list[dict]) -> str:
+    async def generate(
+        self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
+    ) -> str:
         if not self.providers:
             raise RuntimeError("No hay ningún proveedor de IA configurado.")
 
@@ -221,7 +272,7 @@ class ProviderManager:
         for provider in self.providers:
             try:
                 log.debug(f"Generando respuesta con {provider.nombre}...")
-                return await provider.generate(system_prompt, chat_history)
+                return await provider.generate(system_prompt, chat_history, max_tokens)
             except Exception as e:  # noqa: BLE001
                 ultimo_error = e
                 log.warning(f"Fallo en {provider.nombre}: {e}")

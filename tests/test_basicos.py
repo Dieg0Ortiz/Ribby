@@ -164,7 +164,7 @@ class TestClaude(unittest.TestCase):
         class Respaldo(ai_providers.AIProvider):
             nombre = "Respaldo"
 
-            async def generate(self, system_prompt, chat_history):
+            async def generate(self, system_prompt, chat_history, max_tokens=None):
                 return "respaldo ok"
 
         prov, _ = self._proveedor(error=RuntimeError("Claude: servicio saturado (529)"))
@@ -441,15 +441,16 @@ class TestModoPruebas(unittest.TestCase):
         comun.marcar_usuario(333, 123)                  # La misma persona en La Comarca
         self.assertFalse(comun.en_prueba())
 
-    def test_creador_por_nombre_de_usuario(self):
+    def test_creador_solo_por_id(self):
         from types import SimpleNamespace as NS
-        tainy = NS(id=987654321, name="peso_pluma__.")
-        self.assertTrue(comun.es_creador(tainy))
-        self.assertTrue(comun.es_creador_id(987654321))  # Se recuerda el ID
-        self.assertFalse(comun.es_creador(NS(id=5, name="otra_persona")))
-        self.assertTrue(comun.creador_activo(987654321))
+        tainy = 641420040045985803
+        self.assertTrue(comun.es_creador(NS(id=tainy, name="cualquier_nombre")))
+        self.assertTrue(comun.es_creador_id(tainy))
+        # Quien se ponga su antiguo nombre de usuario NO es el creador
+        self.assertFalse(comun.es_creador(NS(id=5, name="peso_pluma__.")))
+        self.assertTrue(comun.creador_activo(tainy))
         comun.activar_modo_global(True)
-        self.assertFalse(comun.creador_activo(987654321))  # En pruebas es un usuario normal
+        self.assertFalse(comun.creador_activo(tainy))  # En pruebas es un usuario normal
 
     def test_afinidad_del_creador(self):
         import afinidad as af
@@ -628,6 +629,39 @@ class TestCargaDeCogs(unittest.TestCase):
                          "prueba activar", "prueba nivel", "prueba tiempo", "prueba capitulo_nuevo",
                          "novedades", "admin_novedades"]:
             self.assertIn(esperado, nombres)
+
+
+class TestPromptCaching(unittest.TestCase):
+    def test_partes_del_system_prompt(self):
+        bloques = ai_providers.ClaudeProvider._system(["fijo", "", "variable"])
+        self.assertEqual(bloques[0], {"type": "text", "text": "fijo", "cache_control": {"type": "ephemeral"}})
+        self.assertEqual(bloques[1], {"type": "text", "text": "variable"})
+        self.assertEqual(ai_providers.ClaudeProvider._system("solo texto"), "solo texto")
+        self.assertEqual(ai_providers.unir_system(["a", "b"]), "a\n\nb")
+
+    def test_prompt_de_ribby_tiene_parte_fija_estable(self):
+        cog = saludos.Saludos.__new__(saludos.Saludos)
+        a = cog._construir_system_prompt("Emlo", "frio", 3, 10, False, contexto_extra="RETOS: nada")
+        b = cog._construir_system_prompt("Pedro", "calido", 40, 99, True, resumen="x", relacion="amigo")
+        self.assertEqual(a[0], b[0])  # La parte cacheable no cambia entre usuarios
+        self.assertNotIn("Emlo", a[0])
+        self.assertIn("Emlo", a[1])
+        self.assertIn("[[RECOMENDAR", a[0])
+
+
+class TestParejaEnElContexto(unittest.TestCase):
+    def test_cualquiera_sabe_quien_es_su_pareja(self):
+        import afinidad as af
+        # Antes, a un desconocido o a un amigo Ribby le decía que no tenía pareja
+        for corazones in (0.0, 20.0):
+            texto = af.contexto_prompt(dict(af.nuevo_estado(), corazones=corazones), True, "Ana")
+            self.assertIn("Tienes pareja: Ana", texto)
+            self.assertIn("hablas BIEN de esa persona", texto)
+
+    def test_con_su_pareja_usa_apodos_cariñosos(self):
+        import afinidad as af
+        texto = af.contexto_prompt(dict(af.nuevo_estado(), corazones=100.0, es_pareja=True), False)
+        self.assertIn("mi amor", texto)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,8 @@ CREATE TABLE public.ribby_memoria (
   mood text DEFAULT 'frio'::text,
   interacciones integer DEFAULT 0,
   ultima_actualizacion timestamp with time zone DEFAULT now(),
+  hechos text DEFAULT '[]',                          -- JSON: datos concretos (memoria.py); añadida por el bot
+  pendientes text DEFAULT '[]',                      -- JSON: cosas con fecha para preguntar; añadida por el bot
   CONSTRAINT ribby_memoria_pkey PRIMARY KEY (usuario_discord_id)
 );
 
@@ -238,6 +240,26 @@ CREATE TABLE public.ribby_capitulos (        -- capítulos de la historia de Rib
   PRIMARY KEY (usuario_discord_id, capitulo)
 );
 
+CREATE TABLE public.relaciones_usuarios (    -- quién responde/menciona a quién (lo crea el bot)
+  usuario_a      text NOT NULL,                -- siempre usuario_a < usuario_b
+  usuario_b      text NOT NULL,
+  interacciones  integer NOT NULL DEFAULT 0,
+  ultima         timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (usuario_a, usuario_b)
+);
+
+CREATE TABLE public.citas_ribby (            -- citas con Ribby (lo crea el bot)
+  id                  serial PRIMARY KEY,
+  usuario_discord_id  text NOT NULL,
+  fecha               timestamptz NOT NULL DEFAULT now(),
+  titulo              text NOT NULL,
+  premisa             text,
+  lugar               text,                    -- ingrediente sorteado, para no repetirlo con esa persona
+  recuerdo            text,                    -- lo que Ribby guarda de la cita
+  desenlace           text,                    -- perfecta | bonita | regular | desastre | a_medias
+  quimica             real
+);
+
 CREATE TABLE public.seguimientos (           -- avisos de capítulos nuevos
   usuario_discord_id  text NOT NULL,
   historia_id         integer NOT NULL REFERENCES public.biblioteca_historias(id) ON DELETE CASCADE,
@@ -250,4 +272,6 @@ CREATE TABLE public.seguimientos (           -- avisos de capítulos nuevos
 -- tablas del bot. El bot lo crea al arrancar con:
 --   CREATE SCHEMA IF NOT EXISTS pruebas;
 --   CREATE TABLE IF NOT EXISTS pruebas.<tabla> (LIKE public.<tabla> INCLUDING ALL);
--- Quién está en modo de pruebas se guarda en public.ribby_config (claves 'modo_prueba:<id>').
+-- El modo de pruebas global se guarda en public.ribby_config (clave 'modo_prueba:global').
+-- Otras claves de ribby_config: 'canal_ribby', 'espontanea' ('off' = sin intervenciones sin @),
+-- 'memoria_comunidad:<servidor>' (lo que Ribby recuerda de la comunidad), 'seguimientos:<fecha>'.
