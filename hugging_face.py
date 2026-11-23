@@ -32,7 +32,8 @@ import config
 log = logging.getLogger("bot-literario.hugging_face")
 
 _URL_MODELO = "https://router.huggingface.co/hf-inference/models/{modelo}"
-_TIMEOUT = aiohttp.ClientTimeout(total=5)
+# Corto: el análisis de tono es un extra; si Hugging Face tarda (modelo "frío"), se usan las reglas
+_TIMEOUT = aiohttp.ClientTimeout(total=3)
 
 # Categorías del clasificador de tono → descripción que entiende el modelo
 CATEGORIAS = {

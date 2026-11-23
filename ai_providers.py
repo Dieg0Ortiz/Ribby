@@ -260,7 +260,11 @@ class ProviderManager:
                 {"HTTP-Referer": "https://github.com/ComarcaLit/Ribby", "X-Title": "Ribby Bot"},
             ))
 
-        log.info(f"ProviderManager inicializado con {len(self.providers)} proveedor(es) de IA.")
+        self.ultimo_proveedor = ""
+        log.info(
+            f"ProviderManager inicializado con {len(self.providers)} proveedor(es) de IA: "
+            + (" → ".join(p.nombre for p in self.providers) or "ninguno")
+        )
 
     async def generate(
         self, system_prompt: SystemPrompt, chat_history: list[dict], max_tokens: Optional[int] = None
@@ -272,7 +276,9 @@ class ProviderManager:
         for provider in self.providers:
             try:
                 log.debug(f"Generando respuesta con {provider.nombre}...")
-                return await provider.generate(system_prompt, chat_history, max_tokens)
+                texto = await provider.generate(system_prompt, chat_history, max_tokens)
+                self.ultimo_proveedor = provider.nombre  # Para los logs de tiempos (¿respondió Claude o un respaldo?)
+                return texto
             except Exception as e:  # noqa: BLE001
                 ultimo_error = e
                 log.warning(f"Fallo en {provider.nombre}: {e}")

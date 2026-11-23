@@ -840,37 +840,39 @@ class Saludos(commands.Cog):
         personas += conv.participantes(entradas, excluir=vistos, limite=5)
         personas = personas[:6]
 
+        async def seguro(coro, defecto):
+            try:
+                return await coro
+            except Exception:  # noqa: BLE001
+                return defecto
+
+        romance = self.bot.get_cog("Afinidad")
+        pareja_coro = romance.pareja() if romance is not None else database.pareja_actual(self.db)  # type: ignore[attr-defined]
+        pareja, relaciones_lista = await asyncio.gather(
+            seguro(pareja_coro, None), seguro(database.relaciones_de(self.db, autor_id, limite=4), []),
+        )
+        relaciones = dict(relaciones_lista)
         lineas: list[str] = []
-        try:
-            pareja = await database.pareja_actual(self.db)
-        except Exception:  # noqa: BLE001
-            pareja = None
+
         if pareja and pareja["usuario_discord_id"] != str(autor_id):
             linea = (
                 f"- Tu pareja actual es {pareja['nombre_display']}. Si preguntan por ella, dices quién es y hablas "
                 "bien de ella, con cariño y orgullo."
             )
             # Cosas concretas y bonitas que contar (solo datos "públicos": gustos, lo que escribe...)
-            try:
-                memoria_pareja = await database.obtener_memoria_usuario(self.db, pareja["usuario_discord_id"]) or {}
-                datos = [h["texto"] for h in mem.cargar_lista(memoria_pareja.get("hechos"))
-                         if h.get("tipo") in _TIPOS_DATOS_COMPARTIBLES][-4:]
-                if memoria_pareja.get("resumen"):
-                    linea += f" Lo que recuerdas de tu pareja: {conv.recortar(memoria_pareja['resumen'], 220)}"
-                if datos:
-                    linea += " Datos: " + "; ".join(datos) + "."
-            except Exception:  # noqa: BLE001
-                pass
+            memoria_pareja = await seguro(database.obtener_memoria_usuario(self.db, pareja["usuario_discord_id"]), None) or {}
+            datos = [h["texto"] for h in mem.cargar_lista(memoria_pareja.get("hechos"))
+                     if h.get("tipo") in _TIPOS_DATOS_COMPARTIBLES][-4:]
+            if memoria_pareja.get("resumen"):
+                linea += f" Lo que recuerdas de tu pareja: {conv.recortar(memoria_pareja['resumen'], 220)}"
+            if datos:
+                linea += " Datos: " + "; ".join(datos) + "."
             momentos = [e["texto"] for e in pareja.get("eventos", []) if e.get("tipo") != "nivel"][-3:]
             if momentos:
                 linea += " Momentos juntos: " + "; ".join(momentos) + "."
             lineas.append(linea)
 
         # Con quién se lleva quien te habla (respuestas y menciones entre ellos)
-        try:
-            relaciones = dict(await database.relaciones_de(self.db, autor_id, limite=4))
-        except Exception:  # noqa: BLE001
-            relaciones = {}
         cercanos = []
         for otro_id, n in relaciones.items():
             if n < _MIN_INTERACCIONES_RELACION:
@@ -881,39 +883,90 @@ class Saludos(commands.Cog):
         if cercanos:
             lineas.append(f"- {message.author.display_name} suele hablar mucho con: {', '.join(cercanos)}.")
 
-        for uid, nombre in personas:
-            try:
-                partes = [nombre]
-                apodo = self._CO_LIDERES.get(uid)
-                if comun.es_creador_id(uid):
-                    partes.append("es Tainy, tu creador (como tu padre)")
-                elif uid == _ID_LIDER:
-                    partes.append("es FunnyJMystery, el líder de La Comarca")
-                elif apodo:
-                    partes.append(f"es {apodo}, co-líder de La Comarca")
-                estado = await database.obtener_afinidad(self.db, uid)
-                if estado and not comun.es_creador_id(uid):
-                    ocupada = bool(pareja and pareja["usuario_discord_id"] != str(uid))
-                    partes.append(f"para ti es: {afinidad.NIVELES[afinidad.nivel(estado, ocupada)][0]}")
-                elif not estado:
-                    partes.append("apenas le conoces")
-                if relaciones.get(str(uid), 0) >= _MIN_INTERACCIONES_RELACION:
-                    partes.append(f"habla a menudo con {message.author.display_name}")
-                memoria_otro = await database.obtener_memoria_usuario(self.db, uid)
-                resumen = ((memoria_otro or {}).get("resumen") or "").strip()
-                if resumen:
-                    partes.append(f"lo que recuerdas: {conv.recortar(resumen, 220)}")
-                # Solo datos "públicos" (apodo, gustos...), nunca los de su vida privada
-                datos = [h["texto"] for h in mem.cargar_lista((memoria_otro or {}).get("hechos"))
-                         if h.get("tipo") in _TIPOS_DATOS_COMPARTIBLES][-3:]
-                if datos:
-                    partes.append("datos: " + "; ".join(datos))
-                lineas.append("- " + "; ".join(partes))
-            except Exception as e:  # noqa: BLE001
-                log.debug(f"Sin contexto de la persona {uid}: {e}")
+        async def describir(uid: int, nombre: str) -> str:
+            partes = [nombre]
+            apodo = self._CO_LIDERES.get(uid)
+            if comun.es_creador_id(uid):
+                partes.append("es Tainy, tu creador (como tu padre)")
+            elif uid == _ID_LIDER:
+                partes.append("es FunnyJMystery, el líder de La Comarca")
+            elif apodo:
+                partes.append(f"es {apodo}, co-líder de La Comarca")
+            estado, memoria_otro = await asyncio.gather(
+                seguro(database.obtener_afinidad(self.db, uid), None),
+                seguro(database.obtener_memoria_usuario(self.db, uid), None),
+            )
+            if estado and not comun.es_creador_id(uid):
+                ocupada = bool(pareja and pareja["usuario_discord_id"] != str(uid))
+                partes.append(f"para ti es: {afinidad.NIVELES[afinidad.nivel(estado, ocupada)][0]}")
+            elif not estado:
+                partes.append("apenas le conoces")
+            if relaciones.get(str(uid), 0) >= _MIN_INTERACCIONES_RELACION:
+                partes.append(f"habla a menudo con {message.author.display_name}")
+            resumen = ((memoria_otro or {}).get("resumen") or "").strip()
+            if resumen:
+                partes.append(f"lo que recuerdas: {conv.recortar(resumen, 220)}")
+            # Solo datos "públicos" (apodo, gustos...), nunca los de su vida privada
+            datos = [h["texto"] for h in mem.cargar_lista((memoria_otro or {}).get("hechos"))
+                     if h.get("tipo") in _TIPOS_DATOS_COMPARTIBLES][-3:]
+            if datos:
+                partes.append("datos: " + "; ".join(datos))
+            return "- " + "; ".join(partes)
+
+        lineas += await asyncio.gather(*(describir(uid, nombre) for uid, nombre in personas))
         if not lineas:
             return ""
         return "OTRAS PERSONAS EN LA CONVERSACIÓN:\n" + "\n".join(lineas)
+
+    async def _reunir_contexto(self, message: discord.Message, texto: str, entradas: list[conv.Entrada]) -> dict:
+        """Todo el contexto que no depende del análisis del mensaje, consultado en paralelo."""
+        biblioteca = self.bot.get_cog("Biblioteca")
+
+        async def seguro(coro, defecto):
+            try:
+                return await coro
+            except Exception as e:  # noqa: BLE001 — un dato que falte no impide responder
+                log.debug(f"Contexto incompleto: {e}")
+                return defecto
+
+        async def fichas() -> str:
+            if biblioteca is None:
+                return ""
+            return await biblioteca.contexto_charla(message.channel.id, texto)  # type: ignore[attr-defined]
+
+        romance = self.bot.get_cog("Afinidad")
+        if romance is not None and message.author is not None:
+            # Calienta la caché de la relación mientras se analiza el mensaje (secretos, corazones...)
+            asyncio.ensure_future(seguro(romance.precargar(message.author.id), None))  # type: ignore[attr-defined]
+
+        personas, evento, comunidad, fichas_txt, respuesta, libros = await asyncio.gather(
+            seguro(self._contexto_personas(message, entradas), ""),
+            seguro(self._contexto_evento(), ""),
+            seguro(self._memoria_comunidad(message.guild.id if message.guild else None), ""),
+            seguro(fichas(), ""),
+            seguro(self._contexto_respuesta(message), ""),
+            seguro(database.contar_libros_biblioteca(self.db), 0),
+        )
+        return {"personas": personas, "evento": evento, "comunidad": comunidad, "fichas": fichas_txt,
+                "respuesta": respuesta, "libros": libros}
+
+    def _escribiendo(self, channel: discord.abc.Messageable) -> None:
+        """Muestra una vez "Ribby está escribiendo…" (una sola petición; respeta los enfriamientos por 429)."""
+        canal_id = getattr(channel, "id", None)
+        ahora = monotonic()
+        if ahora < self._typing_global_silenciado_hasta or ahora < self._typing_silenciado_hasta.get(canal_id, 0.0):
+            return
+
+        async def enviar():
+            try:
+                await channel.typing()  # type: ignore[misc]
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    self._typing_silenciado_hasta[canal_id] = monotonic() + max(1, config.TYPING_COOLDOWN_SECONDS)
+            except Exception:  # noqa: BLE001
+                pass
+
+        asyncio.ensure_future(enviar())
 
     async def _contexto_evento(self) -> str:
         """Qué está pasando ahora mismo con los retos literarios."""
@@ -1116,10 +1169,20 @@ class Saludos(commands.Cog):
         # Si Ribby acaba de arrancar, recupera lo que se habló en el canal antes de responder
         await self._asegurar_contexto(message.channel)
 
+        t_inicio = monotonic()
+        if motivo != "espontanea":
+            self._escribiendo(message.channel)  # Un único "Ribby está escribiendo…" mientras prepara la respuesta
+
+        # El contexto (personas, retos, comunidad, fichas…) se reúne A LA VEZ que se analiza el mensaje
+        entradas = self.memoria.recientes(message.channel.id, excluir_id=message.id)
+        tarea_contexto = asyncio.ensure_future(self._reunir_contexto(message, texto, entradas))
+
         # Análisis del mensaje (Hugging Face; si no está disponible, palabras clave):
         # tono para los corazones y el humor de Ribby, y moderación
         analisis = await hugging_face.analizar(texto, _detectar_tono(texto), afinidad.es_coqueteo(texto))
+        t_analisis = monotonic()
         if analisis.bloquear:
+            tarea_contexto.cancel()
             if motivo != "espontanea":  # Si no le hablaban a ella, no se mete
                 await self._responder_moderacion(message, texto, analisis)
             return
@@ -1131,6 +1194,7 @@ class Saludos(commands.Cog):
             try:
                 respondido, contexto_secreto = await romance.revisar_secreto_frase(message, texto)  # type: ignore[attr-defined]
                 if respondido:
+                    tarea_contexto.cancel()
                     await self._marcar_prueba(message)
                     return
             except Exception as e:  # noqa: BLE001
@@ -1142,13 +1206,11 @@ class Saludos(commands.Cog):
         if biblioteca is not None and motivo != "espontanea":
             try:
                 if await biblioteca.manejar_mencion(message, texto):  # type: ignore[attr-defined]
+                    tarea_contexto.cancel()
                     await self._marcar_prueba(message)
                     return
             except Exception as e:  # noqa: BLE001
                 log.exception(f"Error en la biblioteca: {e}")
-
-        # Obtener tamaño de la biblioteca
-        libros = await database.contar_libros_biblioteca(self.db)
 
         # Medidor de corazones: solo cuando le hablan directamente
         relacion = None
@@ -1197,14 +1259,13 @@ class Saludos(commands.Cog):
                 apodo_colider = self._CO_LIDERES.get(message.author.id, "")
 
                 # ── 6. Conversación del canal (todos los que hablan, y lo que Ribby dijo y mostró) ──
+                ctx = await tarea_contexto
+                libros = ctx["libros"]
                 canal_id = message.channel.id
-                entradas = self.memoria.recientes(canal_id, excluir_id=message.id)
                 actual = conv.entrada_de_mensaje(message, self._ribby_id())
                 if not texto:
                     actual.texto = "(solo te mencionó)"
-                historial = conv.mensajes_para_ia(
-                    entradas, actual, contexto_respuesta=await self._contexto_respuesta(message)
-                )
+                historial = conv.mensajes_para_ia(entradas, actual, contexto_respuesta=ctx["respuesta"])
 
                 # ── 7. Lo que Ribby sabe ahora mismo ──
                 pendientes_hoy = mem.pendientes_para_hoy(estado["pendientes"], hoy) if motivo != "espontanea" else []
@@ -1221,16 +1282,13 @@ class Saludos(commands.Cog):
                         f"hablando; no lo sueltes como un dato suelto): {confidencia_nueva}"
                     ) if confidencia_nueva else "",
                     mem.contexto_persona(estado["hechos"], pendientes_hoy, hoy),
-                    await self._contexto_personas(message, entradas),
+                    ctx["personas"],
                     self._intercambios_otros_canales(estado, canal_id),
-                    await self._contexto_evento(),
-                    await self._memoria_comunidad(message.guild.id if message.guild else None),
+                    ctx["evento"],
+                    ctx["comunidad"],
+                    ctx["fichas"],
                 ]
-                if biblioteca is not None:
-                    try:
-                        bloques.append(await biblioteca.contexto_charla(canal_id, texto))  # type: ignore[attr-defined]
-                    except Exception as e:  # noqa: BLE001
-                        log.debug(f"Sin fichas para la charla: {e}")
+                t_preparado = monotonic()
 
                 system_prompt = self._construir_system_prompt(
                     nombre_usuario=message.author.display_name,
@@ -1247,6 +1305,7 @@ class Saludos(commands.Cog):
 
                 # ── 8. Generar respuesta y ejecutar sus marcas ──
                 crudo = ""
+                t_ia = monotonic()
                 for intento in range(1, _REINTENTOS_IA + 1):
                     try:
                         crudo = await self._generar_con_typing_seguro(message.channel, system_prompt, historial)
@@ -1297,6 +1356,12 @@ class Saludos(commands.Cog):
                     response_text or None, embeds=embeds, mention_author=False, allowed_mentions=_SIN_MENCIONES
                 )
                 respondido = True
+                ahora_fin = monotonic()
+                log.info(
+                    f"⏱️ Respuesta a {message.author.display_name} en {ahora_fin - t_inicio:.1f} s "
+                    f"(análisis {t_analisis - t_inicio:.1f} s · preparación {t_preparado - t_analisis:.1f} s · "
+                    f"IA {ahora_fin - t_ia:.1f} s con {getattr(self.model, 'ultimo_proveedor', '?')})"
+                )
                 await tras_responder()
 
                 # ── 9. Actualizar memoria en BD (después de responder para no retrasar a nadie) ──
@@ -1311,7 +1376,12 @@ class Saludos(commands.Cog):
                 log.exception(f"Error al generar respuesta con la IA (se usará una frase predeterminada): {e}")
 
         if motivo in ("nombre", "espontanea"):
+            tarea_contexto.cancel()
             return  # Sin IA, Ribby no se mete en conversaciones ajenas
+        try:
+            libros = (await tarea_contexto)["libros"]
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            libros = 0
 
         # ── Fallback a respuestas pre-programadas ──────────────────────
         if ribby.es_mencion_negativa(texto.lower()):

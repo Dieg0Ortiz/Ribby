@@ -26,14 +26,17 @@ El nivel de cada uno es privado: solo lo ve el propio usuario.
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import contextlib
+import copy
 import json
 import logging
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from time import monotonic
 from typing import Any, Optional
 
 import asyncpg
@@ -406,6 +409,7 @@ class CapituloView(_SoloAutor):
         async def callback(interaction: discord.Interaction):
             texto, delta, reaccion, recuerdo = self.cap["opciones"][i]
             primera_vez = await database.guardar_capitulo(self.cog.db, self.usuario.id, self.cap["id"], i)
+            self.cog.invalidar_caches(self.usuario.id, pareja=False)  # Cambian los capítulos leídos (secretos)
             nuevos: list[str] = []
             if primera_vez:
                 nuevos = await self.cog.aplicar_actividad(self.usuario, None, delta, recuerdo)
@@ -638,8 +642,60 @@ class Afinidad(commands.Cog):
 
     # ── Persistencia ──
 
+    # Cachés de pocos segundos: un mismo mensaje consultaba la relación y la pareja hasta 7 veces
+    # (secretos, corazones, confidencias, logros...), y cada consulta es un viaje a Supabase.
+    _TTL_RELACION = 10.0
+    _TTL_CASTIGO = 30.0
+
+    def _cache(self, nombre: str) -> dict:
+        if not hasattr(self, "_caches"):
+            self._caches: dict[str, dict] = {"afinidad": {}, "pareja": {}, "castigo": {}}
+        return self._caches[nombre]
+
+    def invalidar_caches(self, usuario_id: Any = None, pareja: bool = True) -> None:
+        """Olvida lo cacheado (de una persona o de todas)."""
+        if pareja:
+            self._cache("pareja").clear()
+        for nombre in ("afinidad", "castigo"):
+            cache = self._cache(nombre)
+            if usuario_id is None:
+                cache.clear()
+            else:
+                for clave in [k for k in cache if k[1] in (str(usuario_id), f"capitulos:{usuario_id}")]:
+                    cache.pop(clave, None)
+
+    async def _cacheado(self, nombre: str, clave: Any, ttl: float, consulta):
+        llave = (comun.en_prueba(), str(clave))
+        cache = self._cache(nombre)
+        guardado = cache.get(llave)
+        if guardado is not None and monotonic() - guardado[0] < ttl:
+            return copy.deepcopy(guardado[1])
+        valor = await consulta()
+        cache[llave] = (monotonic(), valor)
+        return copy.deepcopy(valor)
+
+    async def capitulos(self, usuario_id: int) -> dict[int, int]:
+        return await self._cacheado(
+            "afinidad", f"capitulos:{usuario_id}", self._TTL_RELACION, lambda: database.capitulos_leidos(self.db, usuario_id)
+        )
+
+    async def precargar(self, usuario_id: int) -> None:
+        """
+        Lee de golpe (en paralelo) lo que la charla va a necesitar de esta persona, para
+        que mientras se analiza el mensaje todo quede en caché y luego no haya que esperar.
+        """
+        await asyncio.gather(
+            self.cargar(usuario_id), self.pareja(), self.castigo_activo(usuario_id), self.capitulos(usuario_id),
+            return_exceptions=True,
+        )
+
+    async def pareja(self) -> Optional[dict[str, Any]]:
+        return await self._cacheado("pareja", "", self._TTL_RELACION, lambda: database.pareja_actual(self.db))
+
     async def cargar(self, usuario_id: int) -> dict[str, Any]:
-        estado = await database.obtener_afinidad(self.db, usuario_id) or af.nuevo_estado()
+        estado = await self._cacheado(
+            "afinidad", usuario_id, self._TTL_RELACION, lambda: database.obtener_afinidad(self.db, usuario_id)
+        ) or af.nuevo_estado()
         self._marcar_creador(estado, usuario_id)
         af.aplicar_paso_del_tiempo(estado)
         return estado
@@ -652,10 +708,20 @@ class Afinidad(commands.Cog):
 
     async def guardar(self, usuario: discord.abc.User, estado: dict[str, Any]) -> None:
         ocupada = await self._ocupada_por_otro(usuario.id)
-        await database.guardar_afinidad(self.db, usuario.id, usuario.display_name, estado, af.nivel(estado, ocupada))
+        # La pareja solo cambia si esta persona es (o era) la pareja de Ribby
+        pareja_cacheada = self._cache("pareja").get((comun.en_prueba(), ""))
+        era_pareja = bool(pareja_cacheada and pareja_cacheada[1]
+                          and pareja_cacheada[1].get("usuario_discord_id") == str(usuario.id))
+        try:
+            await database.guardar_afinidad(self.db, usuario.id, usuario.display_name, estado, af.nivel(estado, ocupada))
+        finally:
+            # La caché queda con lo recién guardado (o se olvida si el guardado falló)
+            self.invalidar_caches(usuario.id, pareja=bool(estado.get("es_pareja")) or era_pareja)
+        guardado = dict(copy.deepcopy(estado), usuario_discord_id=str(usuario.id), nombre_display=usuario.display_name)
+        self._cache("afinidad")[(comun.en_prueba(), str(usuario.id))] = (monotonic(), guardado)
 
     async def _ocupada_por_otro(self, usuario_id: int) -> bool:
-        pareja = await database.pareja_actual(self.db)
+        pareja = await self.pareja()
         return bool(pareja and pareja["usuario_discord_id"] != str(usuario_id))
 
     # ── Logros ──
@@ -696,7 +762,7 @@ class Afinidad(commands.Cog):
             coqueteo = af.es_coqueteo(texto)
         usuario = message.author
         estado = await self.cargar(usuario.id)
-        pareja = await database.pareja_actual(self.db)
+        pareja = await self.pareja()
         ocupada = bool(pareja and pareja["usuario_discord_id"] != str(usuario.id))
         nombre_pareja = pareja["nombre_display"] if ocupada and pareja else None
 
@@ -800,7 +866,9 @@ class Afinidad(commands.Cog):
 
     async def castigo_activo(self, usuario_id: Any) -> Optional[dict[str, Any]]:
         """{"hasta", "hasta_texto", "motivo"} si Ribby sigue enfadada con esta persona; None si no."""
-        valor = await database.config_obtener(self.db, f"castigo:{usuario_id}")
+        valor = await self._cacheado(
+            "castigo", usuario_id, self._TTL_CASTIGO, lambda: database.config_obtener(self.db, f"castigo:{usuario_id}")
+        )
         if not valor:
             return None
         try:
@@ -837,6 +905,7 @@ class Afinidad(commands.Cog):
         await database.config_guardar(
             self.db, f"castigo:{usuario.id}", json.dumps({"hasta": hasta.isoformat(), "motivo": motivo}, ensure_ascii=False)
         )
+        self.invalidar_caches(usuario.id)
         saludos = self.bot.get_cog("Saludos")
         if saludos is not None:  # En la charla también se le nota
             estado_charla = await saludos._obtener_estado(usuario.id)  # type: ignore[attr-defined]
@@ -879,7 +948,7 @@ class Afinidad(commands.Cog):
         ahora_local = datetime.now(af.ZONA)
         return sec.Contexto(
             hora=ahora_local.hour, fecha=ahora_local.date(), nivel=af.nivel(estado, ocupada),
-            capitulos=set(await database.capitulos_leidos(self.db, usuario.id)),
+            capitulos=set(await self.capitulos(usuario.id)),
             es_pareja=bool(estado.get("es_pareja")), es_creador=bool(estado.get("es_creador")),
         )
 
@@ -1016,7 +1085,7 @@ class Afinidad(commands.Cog):
         if self._modelo() is None:
             return None
         estado = await self.cargar(usuario.id)
-        pareja = await database.pareja_actual(self.db)
+        pareja = await self.pareja()
         ocupada = bool(pareja and pareja["usuario_discord_id"] != str(usuario.id))
         nivel = af.nivel(estado, ocupada)
         familiar = nivel == "creador"  # Con Tainy: tarde padre-hija, nunca una cita romántica
@@ -1063,7 +1132,7 @@ class Afinidad(commands.Cog):
             return " ".join(partes)
 
         try:
-            pareja = await database.pareja_actual(self.db)
+            pareja = await self.pareja()
             if pareja:
                 uid = pareja["usuario_discord_id"]
                 dias = af.dias_desde(pareja.get("fecha_inicio_pareja"))
@@ -1177,11 +1246,12 @@ class Afinidad(commands.Cog):
     async def revisar_pareja(self):
         """Si la pareja lleva semanas sin aparecer, la relación termina y el puesto queda libre."""
         try:
-            pareja = await database.pareja_actual(self.db)
+            pareja = await self.pareja()
             if pareja and af.aplicar_paso_del_tiempo(pareja):
                 await database.guardar_afinidad(
                     self.db, pareja["usuario_discord_id"], pareja["nombre_display"], pareja, af.nivel(pareja)
                 )
+                self.invalidar_caches()
                 log.info(f"💔 La relación con {pareja['nombre_display']} terminó por inactividad")
         except Exception as e:  # noqa: BLE001
             log.warning(f"No se pudo revisar la pareja de Ribby: {e}")
@@ -1285,7 +1355,7 @@ class Afinidad(commands.Cog):
             await self.aplicar_actividad(miembro, None, 3.0, f"Ribby le felicitó por su cumpleaños ({hoy.year})")
 
         # 3) Aniversario mensual con la pareja
-        pareja = await database.pareja_actual(self.db)
+        pareja = await self.pareja()
         inicio = pareja and pareja.get("fecha_inicio_pareja")
         if pareja and inicio:
             fecha = datetime.fromisoformat(inicio).astimezone(af.ZONA).date()
@@ -1486,6 +1556,7 @@ class Afinidad(commands.Cog):
         if not await self.castigo_activo(usuario.id):
             return await interaction.response.send_message("Esa persona no está castigada. 🤔", ephemeral=True)
         await database.config_borrar(self.db, f"castigo:{usuario.id}")
+        self.invalidar_caches(usuario.id)
         saludos = self.bot.get_cog("Saludos")
         if saludos is not None:
             (await saludos._obtener_estado(usuario.id))["mood"] = "frio"  # type: ignore[attr-defined]
@@ -1846,6 +1917,7 @@ class Afinidad(commands.Cog):
         if not es_admin(interaction):
             return await interaction.response.send_message("⛔ Solo el staff puede hacer esto.", ephemeral=True)
         ok = await database.reiniciar_afinidad(self.db, usuario.id)
+        self.invalidar_caches(usuario.id)
         await interaction.response.send_message(
             f"🔄 Relación de {usuario.mention} con Ribby reiniciada." if ok else "Ese usuario no tenía nada con Ribby.",
             ephemeral=True,

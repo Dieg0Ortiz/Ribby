@@ -74,6 +74,9 @@ class Pruebas(commands.Cog):
         biblioteca = self.bot.get_cog("Biblioteca")
         if biblioteca is not None:
             biblioteca.invalidar(todo=True)  # type: ignore[attr-defined]
+        romance = self.bot.get_cog("Afinidad")
+        if romance is not None:
+            romance.invalidar_caches()  # type: ignore[attr-defined]
 
     async def _exigir_modo(self, interaction: discord.Interaction) -> bool:
         if not _puede_probar(interaction):
