@@ -169,6 +169,10 @@ async def init_db() -> PoolEnrutado:
     pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
     await _asegurar_esquema(pool)
     try:
+        await asegurar_tabla_mensajes(pool)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"No se pudo crear la tabla de mensajes atendidos: {e}")
+    try:
         await preparar_esquema_pruebas(pool)
     except Exception as e:  # noqa: BLE001 — el bot funciona aunque no haya esquema de pruebas
         log.warning(f"No se pudo preparar el esquema de pruebas: {e}")
@@ -1766,3 +1770,57 @@ async def resenas_de_usuario(pool: asyncpg.Pool, discord_id) -> list[Dict[str, A
             str(discord_id),
         )
         return [dict(r) for r in rows]
+
+
+# ─────────────────────────── Varias copias del bot ───────────────────────────
+#
+# Si por error hay dos procesos de Ribby conectados (un despliegue viejo, una
+# prueba en local...), los dos reciben los mismos mensajes y responderían dos
+# veces. Antes de contestar, cada copia "reclama" el mensaje: solo responde la
+# que lo consigue. Va siempre al esquema real (es coordinación, no datos).
+
+async def asegurar_tabla_mensajes(pool: Any) -> None:
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS public.mensajes_atendidos ("
+            " mensaje_id BIGINT PRIMARY KEY, instancia TEXT, fecha TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+        await conn.execute("ALTER TABLE public.mensajes_atendidos ENABLE ROW LEVEL SECURITY")
+
+
+async def reclamar_mensaje(pool: Any, mensaje_id: int, instancia: str) -> bool:
+    """True si esta copia del bot es la primera en atender el mensaje."""
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        return bool(await conn.fetchval(
+            "INSERT INTO public.mensajes_atendidos (mensaje_id, instancia) VALUES ($1, $2) "
+            "ON CONFLICT DO NOTHING RETURNING TRUE",
+            mensaje_id, instancia,
+        ))
+
+
+async def limpiar_mensajes_atendidos(pool: Any) -> None:
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        await conn.execute("DELETE FROM public.mensajes_atendidos WHERE fecha < NOW() - INTERVAL '1 day'")
+
+
+async def latido_instancia(pool: Any, instancia: str) -> list[tuple[str, datetime]]:
+    """Anota que esta copia sigue viva y devuelve las OTRAS copias activas en los últimos 3 minutos."""
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO public.ribby_config (clave, valor) VALUES ($1, 'viva') "
+            "ON CONFLICT (clave) DO UPDATE SET fecha = NOW()",
+            f"instancia:{instancia}",
+        )
+        await conn.execute(
+            "DELETE FROM public.ribby_config WHERE clave LIKE 'instancia:%' AND fecha < NOW() - INTERVAL '1 day'"
+        )
+        rows = await conn.fetch(
+            "SELECT clave, fecha FROM public.ribby_config WHERE clave LIKE 'instancia:%' AND clave <> $1 "
+            "AND fecha > NOW() - INTERVAL '3 minutes'",
+            f"instancia:{instancia}",
+        )
+        return [(r["clave"].split(":", 1)[1], r["fecha"]) for r in rows]

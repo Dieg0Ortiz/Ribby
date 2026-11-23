@@ -10,8 +10,10 @@ pasadas mediante resúmenes persistidos en base de datos.
 import asyncio
 import contextlib
 import logging
+import os
 import random
 import re
+import socket
 from collections import Counter, OrderedDict
 from datetime import date, datetime, timezone
 from time import monotonic
@@ -101,6 +103,12 @@ _INSTRUCCION_MOTIVO = {
 }
 
 
+# Identifica esta copia del bot (para detectar si hay dos conectadas a la vez)
+INSTANCIA = f"{socket.gethostname()}:{os.getpid()}"
+_REINTENTOS_IA = 2                # Antes de recurrir a una respuesta predeterminada
+_ESPERA_REINTENTO_IA = 2.0
+
+
 def _hoy() -> date:
     return datetime.now(afinidad.ZONA).date()
 
@@ -181,6 +189,8 @@ class Saludos(commands.Cog):
         # Canal → último instante en que habló sin @ (cada tipo con su propio enfriamiento)
         self._ultima_por_nombre: dict[int, float] = {}
         self._ultima_espontanea: dict[int, float] = {}
+        self.instancia = INSTANCIA
+        self.otras_instancias: list[str] = []
 
         try:
             self.model = ProviderManager(config)
@@ -775,13 +785,44 @@ class Saludos(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"No se pudieron guardar las relaciones entre usuarios: {e}")
 
+    @tasks.loop(minutes=1)
+    async def latido(self):
+        """Avisa en los logs si hay otra copia de Ribby conectada (respondería dos veces)."""
+        try:
+            otras = await database.latido_instancia(self.db, INSTANCIA)
+            self.otras_instancias = [nombre for nombre, _ in otras]
+            if otras:
+                log.warning(
+                    f"⚠️ HAY OTRA COPIA DE RIBBY CONECTADA ({', '.join(self.otras_instancias)}); esta es {INSTANCIA}. "
+                    "Apaga la que sobre: si no, puede haber respuestas duplicadas."
+                )
+            if self.latido.current_loop % 60 == 0:
+                await database.limpiar_mensajes_atendidos(self.db)
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"No se pudo registrar el latido: {e}")
+
     @commands.Cog.listener()
     async def on_ready(self):
+        log.info(f"🎀 Esta copia de Ribby es {INSTANCIA}")
         if not self.guardar_relaciones.is_running():
             self.guardar_relaciones.start()
+        if not self.latido.is_running():
+            self.latido.start()
 
     async def cog_unload(self):
         self.guardar_relaciones.cancel()
+        self.latido.cancel()
+
+    async def _reclamar(self, message: discord.Message) -> bool:
+        """Solo una copia del bot atiende cada mensaje (si la BD falla, se atiende igualmente)."""
+        try:
+            if await database.reclamar_mensaje(self.db, message.id, INSTANCIA):
+                return True
+            log.info(f"Mensaje {message.id} ya atendido por otra copia de Ribby; esta ({INSTANCIA}) no responde")
+            return False
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"No se pudo reclamar el mensaje {message.id}: {e}")
+            return True
 
     # ── Contexto para la IA ───────────────────────────────────────────
 
@@ -1053,6 +1094,10 @@ class Saludos(commands.Cog):
         while len(self._respondidos) > _MAX_RESPONDIDOS:
             self._respondidos.popitem(last=False)  # Descarta los más antiguos
 
+        # Si hay otra copia de Ribby conectada, solo responde una
+        if not await self._reclamar(message):
+            return
+
         # Limpiar el contenido: quitar menciones para analizar solo el texto
         texto = re.sub(r"<@!?\d+>", "", message.content).strip()
 
@@ -1130,6 +1175,7 @@ class Saludos(commands.Cog):
                 await romance.despues_de_responder(message, relacion)  # type: ignore[attr-defined]
             await self._marcar_prueba(message)
 
+        respondido = False
         if self.model:
             try:
                 hoy = _hoy()
@@ -1200,7 +1246,16 @@ class Saludos(commands.Cog):
                 )
 
                 # ── 8. Generar respuesta y ejecutar sus marcas ──
-                crudo = await self._generar_con_typing_seguro(message.channel, system_prompt, historial)
+                crudo = ""
+                for intento in range(1, _REINTENTOS_IA + 1):
+                    try:
+                        crudo = await self._generar_con_typing_seguro(message.channel, system_prompt, historial)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if intento == _REINTENTOS_IA:
+                            raise
+                        log.warning(f"La IA falló (intento {intento}): {e}. Reintentando...")
+                        await asyncio.sleep(_ESPERA_REINTENTO_IA)
                 response_text, marcas = conv.extraer_marcas(crudo or "")
                 response_text = conv.limpiar_respuesta(response_text)[:_MAX_CARACTERES_DISCORD] if response_text else ""
 
@@ -1241,6 +1296,7 @@ class Saludos(commands.Cog):
                 await message.reply(
                     response_text or None, embeds=embeds, mention_author=False, allowed_mentions=_SIN_MENCIONES
                 )
+                respondido = True
                 await tras_responder()
 
                 # ── 9. Actualizar memoria en BD (después de responder para no retrasar a nadie) ──
@@ -1248,9 +1304,11 @@ class Saludos(commands.Cog):
                     await self._actualizar_memoria(message.author.id, estado, message.author.display_name)
                 return
 
-            except Exception as e:
-                log.error(f"Error al generar respuesta con la IA: {e}")
-                # Si hay error, pasa al fallback
+            except Exception as e:  # noqa: BLE001
+                if respondido:  # El fallo fue después de contestar: nunca se manda un mensaje predeterminado encima
+                    log.exception(f"Error después de responder a {message.author.display_name}: {e}")
+                    return
+                log.exception(f"Error al generar respuesta con la IA (se usará una frase predeterminada): {e}")
 
         if motivo in ("nombre", "espontanea"):
             return  # Sin IA, Ribby no se mete en conversaciones ajenas

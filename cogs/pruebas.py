@@ -177,6 +177,15 @@ class Pruebas(commands.Cog):
                      "En La Comarca, Ribby funciona con los datos reales.")
         else:
             texto = "✅ Modo de pruebas **desactivado**: Ribby usa los datos reales."
+        saludos = self.bot.get_cog("Saludos")
+        if saludos is not None:
+            otras = getattr(saludos, "otras_instancias", [])
+            texto += f"\n🖥️ Esta copia de Ribby: `{getattr(saludos, 'instancia', '?')}`"
+            if otras:
+                texto += (
+                    f"\n⚠️ **Hay {len(otras)} copia(s) más conectadas:** " + ", ".join(f"`{o}`" for o in otras)
+                    + "\nApágalas: si no, pueden salir respuestas duplicadas (una de ellas con frases predeterminadas)."
+                )
         forzado = comun.eventos_forzados.get(interaction.user.id)
         if forzado and comun.en_prueba():
             texto += f"\n🎉 Evento forzado para ti: **{forzado}**"
