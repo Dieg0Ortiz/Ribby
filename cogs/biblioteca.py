@@ -81,6 +81,15 @@ def _ficha_charla(h: dict[str, Any]) -> str:
 _MIN_PALABRAS_RESUMEN = 6
 
 
+def etiqueta_historia(h: dict[str, Any], con_autor: bool = True) -> str:
+    """'📖 Título · Autor' (Wattpad) o '🏆 Título · Autor' (reto), para menús y desplegables (máx. 100 caracteres)."""
+    icono = "🏆" if rec.es_reto(h) else "📖"
+    titulo = (h.get("titulo") or "Sin título").strip()
+    autor = (h.get("autor_nombre") or "").strip()
+    texto = f"{icono} {titulo}" + (f" · {autor}" if con_autor and autor else "")
+    return texto if len(texto) <= 100 else texto[:99].rstrip() + "…"
+
+
 def _separar(texto: str) -> list[str]:
     return [t.strip().lstrip("#") for t in texto.replace(";", ",").replace("\n", ",").split(",") if t.strip()]
 
@@ -282,6 +291,100 @@ class PedirResumenView(discord.ui.View):
         await interaction.response.send_modal(TextoLibreModal(self.historia["titulo"], "Resumen", True, guardar))
 
 
+class ExplorarView(discord.ui.View):
+    """Recorre TODAS las historias de la biblioteca (25 por página) y abre la ficha de la que elijas."""
+
+    POR_PAGINA = 25
+    FUENTES = ["todas", "wattpad", "reto"]
+    NOMBRES = {"todas": "📚 Todas", "wattpad": "📖 Wattpad", "reto": "🏆 Retos"}
+
+    def __init__(self, cog: "Biblioteca", catalogo: list[dict[str, Any]], fuente: str = "todas"):
+        super().__init__(timeout=600)
+        self.cog, self.catalogo = cog, catalogo
+        self.fuente, self.pagina = fuente, 0
+        self.message: Optional[discord.Message] = None
+        self._construir()
+
+    def _historias(self) -> list[dict[str, Any]]:
+        return sorted(rec.filtrar_fuente(self.catalogo, self.fuente), key=lambda h: rec.normalizar(h.get("titulo")))
+
+    def _paginas(self, total: int) -> int:
+        return max(1, -(-total // self.POR_PAGINA))
+
+    def embed(self) -> discord.Embed:
+        historias = self._historias()
+        paginas = self._paginas(len(historias))
+        self.pagina = min(self.pagina, paginas - 1)
+        wattpad = sum(1 for h in self.catalogo if h.get("wattpad_id"))
+        retos = sum(1 for h in self.catalogo if rec.es_reto(h))
+        inicio = self.pagina * self.POR_PAGINA
+        trozo = historias[inicio:inicio + self.POR_PAGINA]
+        lineas = [f"`{inicio + i}.` {md(etiqueta_historia(h, con_autor=False))}" for i, h in enumerate(trozo, 1)]
+        e = discord.Embed(
+            title=f"📚  La biblioteca de Ribby — {self.NOMBRES[self.fuente]}",
+            description=("\n".join(lineas) or "*No hay historias en esta categoría.*")
+                        + "\n\n*Elige una en el menú de abajo para ver su ficha.*",
+            color=config.COLOR_PRINCIPAL,
+        )
+        e.set_footer(text=f"Página {self.pagina + 1} de {paginas}  •  {len(historias)} historias "
+                          f"({len(self.catalogo)} en total: {wattpad} de Wattpad, {retos} de retos)")
+        return e
+
+    def _construir(self) -> None:
+        self.clear_items()
+        historias = self._historias()
+        paginas = self._paginas(len(historias))
+        self.pagina = min(self.pagina, paginas - 1)
+        trozo = historias[self.pagina * self.POR_PAGINA:(self.pagina + 1) * self.POR_PAGINA]
+        if trozo:
+            select = discord.ui.Select(
+                placeholder="Elige una historia para ver su ficha...",
+                options=[
+                    discord.SelectOption(
+                        label=etiqueta_historia(h, con_autor=False)[:100], value=str(h["id"]),
+                        description=(f"{h.get('autor_nombre') or 'Autor desconocido'}"
+                                     + (f" · ⭐ {h['nota_media']}" if h.get("nota_media") is not None else ""))[:100],
+                    )
+                    for h in trozo
+                ],
+            )
+            select.callback = self._ver  # type: ignore[method-assign]
+            self.add_item(select)
+        anterior = discord.ui.Button(emoji="◀", style=discord.ButtonStyle.secondary, disabled=self.pagina <= 0, row=1)
+        anterior.callback = self._mover(-1)  # type: ignore[method-assign]
+        siguiente = discord.ui.Button(emoji="▶", style=discord.ButtonStyle.secondary, disabled=self.pagina >= paginas - 1, row=1)
+        siguiente.callback = self._mover(1)  # type: ignore[method-assign]
+        filtro = discord.ui.Button(label=f"Mostrando: {self.NOMBRES[self.fuente]} (cambiar)", style=discord.ButtonStyle.primary, row=1)
+        filtro.callback = self._cambiar_fuente  # type: ignore[method-assign]
+        for b in (anterior, siguiente, filtro):
+            self.add_item(b)
+
+    def _mover(self, paso: int):
+        async def callback(interaction: discord.Interaction):
+            self.pagina = max(0, self.pagina + paso)
+            self._construir()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        return callback
+
+    async def _cambiar_fuente(self, interaction: discord.Interaction):
+        self.fuente = self.FUENTES[(self.FUENTES.index(self.fuente) + 1) % len(self.FUENTES)]
+        self.pagina = 0
+        self._construir()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _ver(self, interaction: discord.Interaction):
+        valor = int(interaction.data["values"][0])  # type: ignore[index]
+        h = next((x for x in self.catalogo if x["id"] == valor), None)
+        if h is None:
+            return await interaction.response.send_message("Esa historia ya no está en mis estantes 🤔", ephemeral=True)
+        await interaction.response.send_message(embeds=await self.cog.tarjetas([h]), ephemeral=True)
+
+    async def on_timeout(self):
+        if self.message:
+            with contextlib.suppress(discord.HTTPException):
+                await self.message.edit(view=None)
+
+
 # ─────────────────────────── Cog ───────────────────────────
 
 class Biblioteca(commands.Cog):
@@ -470,7 +573,57 @@ class Biblioteca(commands.Cog):
 
     # ── Recomendación ──
 
+    async def historias_de(
+        self, usuario_id: int, nombre: str, propias: bool = True
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Las historias de una persona (las del que pregunta o las de otra a la que menciona)."""
+        historias = rec.historias_de_autor(await self.catalogo(), usuario_id)
+        if not historias:
+            if propias:
+                return (
+                    "No tengo historias tuyas en mis estantes 🤔 Vincula tu cuenta con `/biblioteca vincular_wattpad` "
+                    "(las traigo todas) o añade una con `/biblioteca agregar`. Si participaste en un reto, también "
+                    "cuentan.", [],
+                )
+            return f"No tengo historias de **{md(nombre)}** en mis estantes. Quizá aún no ha vinculado su Wattpad. 🤔", []
+        lineas = [
+            f"**{i}.** {md(h['titulo'])}"
+            + (f" — ⭐ {h['nota_media']} ({h['num_resenas']})" if h.get("nota_media") is not None else "")
+            + (" · 🏆 reto" if rec.es_reto(h) else "")
+            for i, h in enumerate(historias[:15], 1)
+        ]
+        mas = f"\n*…y {len(historias) - 15} más.*" if len(historias) > 15 else ""
+        quien = "tuyas" if propias else f"de **{md(nombre)}**"
+        return (
+            f"📚 **Historias {quien} en mi biblioteca** ({len(historias)}):\n" + "\n".join(lineas) + mas
+            + ("\n*Perfil completo con `/biblioteca autor`.*" if propias else ""),
+            historias[:5],
+        )
+
+    async def mejores_resenadas(self, consulta: str = "") -> tuple[str, list[dict[str, Any]]]:
+        """Las historias con mejor nota en las reseñas reales de la comunidad (no es una opinión de la IA)."""
+        historias, filtrado = rec.ranking_mejores(await self.catalogo(), consulta, n=5)
+        if not historias:
+            return (
+                "Todavía no hay reseñas en mi biblioteca, así que no puedo decir cuáles son las mejores 📚 "
+                "Lee alguna historia y cuéntanos qué te pareció con `/biblioteca resenar`; así entrará al ranking. 🖋️",
+                [],
+            )
+        lineas = [
+            f"**{i}.** {md(h['titulo'])} — ⭐ **{h['nota_media']}** / 5 "
+            f"({h['num_resenas']} reseña{'s' if h['num_resenas'] != 1 else ''})"
+            for i, h in enumerate(historias, 1)
+        ]
+        tema = " de ese tema" if filtrado else ""
+        nota = ("\n*Las reseñas van de 1 a 5 ⭐, así que un 10/10 es un 5.* Solo cuentan las historias que ya tienen "
+                "reseñas; si quieres que otra entre en el ranking, ¡reséñala! 🖋️")
+        return f"🏆 **Las mejor puntuadas{tema} por la comunidad de La Comarca:**\n" + "\n".join(lineas) + nota, historias
+
     async def recomendar(self, consulta: str, usuario_id: int) -> tuple[str, list[dict[str, Any]]]:
+        if rec.es_peticion_propias(consulta):  # "mis historias": las suyas de verdad, no una recomendación por temas
+            return await self.historias_de(usuario_id, "", propias=True)
+        if rec.es_peticion_mejores(consulta):  # "las mejores" se responde con datos reales, no con la opinión de la IA
+            return await self.mejores_resenadas(consulta)
         catalogo = await self.catalogo()
         if not catalogo:
             return "Mis estantes están vacíos ahora mismo... vuelve en un rato, estoy acomodando libros 📚", []
@@ -578,6 +731,25 @@ class Biblioteca(commands.Cog):
         if rec.es_peticion_resumen(texto):
             await self._responder_resumen(message, texto)
             return True
+        otros = [m for m in message.mentions if not m.bot and m.id != message.author.id]
+        if rec.es_peticion_propias(texto) or (otros and rec.es_peticion_de_autor(texto)):
+            # "mis historias" o "historias de @alguien": se muestran las de esa persona, no una recomendación por temas
+            objetivo = otros[0] if otros and not rec.es_peticion_propias(texto) else message.author
+            mensaje, historias = await self.historias_de(
+                objetivo.id, objetivo.display_name, propias=objetivo.id == message.author.id
+            )
+            await message.reply(
+                mensaje, embeds=await self.tarjetas(historias), mention_author=False, allowed_mentions=_SIN_PING
+            )
+            self.recordar_mostradas(message.channel.id, historias)
+            return True
+        if rec.es_peticion_mejores(texto):
+            mensaje, historias = await self.mejores_resenadas(texto)
+            await message.reply(
+                mensaje, embeds=await self.tarjetas(historias), mention_author=False, allowed_mentions=_SIN_PING
+            )
+            self.recordar_mostradas(message.channel.id, historias)
+            return True
         if rec.es_peticion_recomendacion(texto):
             # El indicador "escribiendo..." solo si está activado (Discord limita mucho ese endpoint)
             escribiendo = message.channel.typing() if config.ENABLE_TYPING_INDICATOR else contextlib.nullcontext()
@@ -679,14 +851,38 @@ class Biblioteca(commands.Cog):
         return rec.buscar_por_titulo(catalogo, valor, umbral=0.5)
 
     async def autocompletar_historia(self, interaction: discord.Interaction, actual: str) -> list[app_commands.Choice[str]]:
+        """
+        Discord solo muestra 25 opciones. Sin texto se mezclan Wattpad y retos (los retos, que se guardaron
+        primero, ocupaban todo el espacio); al escribir se busca en título, autor y etiquetas.
+        Para recorrer TODAS las historias está /biblioteca explorar.
+        """
+        historias = rec.buscar_para_autocompletar(await self.catalogo(), actual, 25)
+        return [app_commands.Choice(name=etiqueta_historia(h), value=str(h["id"])) for h in historias]
+
+    @grupo.command(name="explorar", description="Recorre TODAS las historias de la biblioteca (Wattpad y retos) y abre su ficha")
+    @app_commands.describe(fuente="Qué historias ver (por defecto, todas)")
+    @app_commands.choices(fuente=[
+        app_commands.Choice(name="Todas", value="todas"), app_commands.Choice(name="Solo Wattpad", value="wattpad"),
+        app_commands.Choice(name="Solo retos literarios", value="reto"),
+    ])
+    async def cmd_explorar(self, interaction: discord.Interaction, fuente: Optional[app_commands.Choice[str]] = None):
         catalogo = await self.catalogo()
-        n = rec.normalizar(actual)
-        if n:
-            catalogo = sorted(
-                catalogo,
-                key=lambda h: (n not in rec.normalizar(h["titulo"]), -rec.puntuar(h, rec.palabras_clave(actual))),
+        if not catalogo:
+            return await interaction.response.send_message(
+                "Mis estantes están vacíos ahora mismo 📚 Prueba con `/biblioteca sincronizar` (staff).", ephemeral=True
             )
-        return [app_commands.Choice(name=(h["titulo"] or "Sin título")[:100], value=str(h["id"])) for h in catalogo[:25]]
+        vista = ExplorarView(self, catalogo, fuente.value if fuente else "todas")
+        await interaction.response.send_message(embed=vista.embed(), view=vista, ephemeral=True)
+        vista.message = await interaction.original_response()
+
+    @grupo.command(name="mejores", description="Las historias mejor puntuadas en las reseñas de la comunidad")
+    @app_commands.describe(tema="(Opcional) Un género o Pokémon, ej. 'romance' o 'Lycanroc'")
+    async def cmd_mejores(self, interaction: discord.Interaction, tema: Optional[app_commands.Range[str, 1, 100]] = None):
+        await interaction.response.defer()
+        mensaje, historias = await self.mejores_resenadas(tema or "")
+        await interaction.followup.send(mensaje, embeds=await self.tarjetas(historias), allowed_mentions=_SIN_PING)
+        if interaction.channel:
+            self.recordar_mostradas(interaction.channel.id, historias)
 
     @grupo.command(name="recomendar", description="Ribby te recomienda historias de su biblioteca")
     @app_commands.describe(peticion="Qué te apetece leer (ej. 'romance escolar con Lycanroc')")

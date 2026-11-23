@@ -194,6 +194,138 @@ _RE_RESUMEN = re.compile(
 _RE_AGREGAR = re.compile(r"a[ñn]ad|agreg|guard|sum[aá]|biblioteca|recomiendo|buen[ao]|te paso|mira", re.I)
 
 
+# "Las mejores": 10/10, 9/10, "mejor puntuadas", "más valoradas", "top", "las mejores historias"…
+_RE_MEJORES = re.compile(
+    r"\b(10|diez|9|nueve)\s*(/|sobre|de)\s*10\b|\b(5|cinco)\s*(estrellas|/\s*5)|\bnota (m[aá]s )?alta\b"
+    r"|\bmejor(es)?\s+(puntuad|calificad|valorad|rese[ñn]ad|nota|punt)\w*|\bm[aá]s\s+(puntuad|valorad|calificad)\w*"
+    r"|\b(top|ranking)\b|\b(las|los)\s+mejores\s+(historias|fics|fanfics|libros|lecturas|obras)\b"
+    r"|\bmejores\s+(historias|fics|fanfics|libros|lecturas|obras)\b|\bbien\s+(puntuad|valorad|calificad)\w*",
+    re.I,
+)
+# Palabras de la petición que no son un tema (para saber si, además, piden un género o un Pokémon)
+_PALABRAS_RANKING = {
+    "mejor", "mejores", "puntuada", "puntuadas", "puntuado", "puntuados", "valorada", "valoradas", "calificada",
+    "calificadas", "resenada", "resenadas", "nota", "alta", "top", "ranking", "ejemplos", "ejemplo", "compartir",
+    "compartas", "muestra", "muestrame", "dime", "cuales", "cual", "comunidad", "comarca", "diez", "nueve",
+    "estrellas", "cinco", "sobre", "ribby", "mas",
+}
+
+
+# "Mis historias": las que escribió quien pregunta (o, si menciona a alguien, las de esa persona)
+_RE_PROPIAS = re.compile(
+    r"\bque\s+(yo\s+)?(haya|he|hice|escrib[ií]|cre[eé]|publiqu[eé])\b[^.?!]{0,15}?(escrit|cread|publicad|hech|escrib|cre[eé]|publiqu)?"
+    r"|\bmis\s+(historias|fics|fanfics|libros|obras|escritos|lecturas)\b|\b(historias|fics|fanfics|libros|obras|escritos)\s+m[ií]as\b"
+    r"|\bde\s+mi\s+autor[ií]a\b|\b(escrit[ao]s?|cread[ao]s?)\s+por\s+m[ií]\b|\bmi\s+(wattpad|cuenta de wattpad)\b"
+    r"|\blas?\s+que\s+escrib[ií]\b",
+    re.I,
+)
+_RE_DE_AUTOR = re.compile(
+    r"\b(historias|fics|fanfics|libros|obras|escritos)\b[^.?!]{0,30}?\b(de|escrit\w+\s+por|que\s+(ha|haya)\s+escrit\w*|que\s+escribi[oó])\b",
+    re.I,
+)
+_RE_NEGADA = re.compile(r"\bque\s+(yo\s+)?no\s+(haya|he|sean|escrib)|\bno\s+(sean|son)\s+m[ií]as|\bsin\s+(mis|las m[ií]as)\b", re.I)
+
+
+def es_peticion_propias(texto: str) -> bool:
+    """'Recomiéndame historias que yo haya escrito', 'mis historias'… (no 'que yo NO haya escrito')."""
+    t = texto or ""
+    if _RE_NEGADA.search(t):
+        return False
+    m = _RE_PROPIAS.search(t)
+    if not m:
+        return False
+    # "que yo haya/he" solo vale si habla de escribir/crear/publicar (no "que yo haya leído")
+    if m.group(0).lower().startswith("que"):
+        return bool(re.search(r"\b(escrit|escrib|cre[eé]|cread|publica|publiqu|hech|hice|autor)", t, re.I))
+    return True
+
+
+def es_peticion_de_autor(texto: str) -> bool:
+    """'historias de @Ori', 'fics escritos por @X': solo tiene sentido si, además, mencionan a alguien."""
+    return bool(_RE_DE_AUTOR.search(texto or ""))
+
+
+def historias_de_autor(catalogo: list[dict[str, Any]], discord_id: Any) -> list[dict[str, Any]]:
+    """Historias cuyo autor (vinculado por su Wattpad o por el reto) es esa persona, las más leídas primero."""
+    propias = [h for h in catalogo if str(h.get("autor_discord") or "") == str(discord_id)]
+    return sorted(propias, key=lambda h: (-(h.get("lecturas") or 0), h.get("id", 0)))
+
+
+def es_reto(h: dict[str, Any]) -> bool:
+    """¿La historia participó en un reto literario? (puede ser, a la vez, una historia de Wattpad)"""
+    return bool(h.get("participante_id")) or h.get("fuente") == "reto"
+
+
+def filtrar_fuente(catalogo: list[dict[str, Any]], fuente: str) -> list[dict[str, Any]]:
+    """fuente: 'todas' | 'wattpad' | 'reto'."""
+    if fuente == "reto":
+        return [h for h in catalogo if es_reto(h)]
+    if fuente == "wattpad":
+        return [h for h in catalogo if h.get("wattpad_id")]
+    return list(catalogo)
+
+
+def buscar_para_autocompletar(catalogo: list[dict[str, Any]], texto: str, limite: int = 25) -> list[dict[str, Any]]:
+    """
+    Historias para el desplegable de Discord (máximo 25).
+    - Sin texto: Wattpad y retos a partes iguales (las de Wattpad más leídas y los retos más recientes),
+      para que los retos no ocupen todo el espacio.
+    - Con texto: busca en título, autor y etiquetas; primero los títulos que empiezan por lo escrito.
+    """
+    n = normalizar(texto)
+    if not n:
+        wattpad = sorted((h for h in catalogo if not es_reto(h)), key=lambda h: -(h.get("lecturas") or 0))
+        retos = sorted((h for h in catalogo if es_reto(h)), key=lambda h: -h.get("id", 0))
+        mezcla: list[dict[str, Any]] = []
+        for a, b in zip(wattpad, retos):
+            mezcla += [a, b]
+        sobrantes = wattpad[len(retos):] if len(wattpad) > len(retos) else retos[len(wattpad):]
+        return (mezcla + sobrantes)[:limite]
+
+    palabras = n.split()
+    claves = palabras_clave(texto)
+    candidatas: list[tuple[tuple, dict[str, Any]]] = []
+    for h in catalogo:
+        titulo = normalizar(h.get("titulo"))
+        autor = f"{normalizar(h.get('autor_nombre'))} {normalizar(h.get('autor_wattpad'))}"
+        if titulo.startswith(n):
+            rango = 0
+        elif n in titulo or all(p in titulo for p in palabras):
+            rango = 1
+        elif n in autor or all(p in autor for p in palabras):
+            rango = 2
+        elif claves and puntuar(h, claves) > 0:
+            rango = 3
+        else:
+            continue
+        candidatas.append(((rango, -puntuar(h, claves) if claves else 0, titulo), h))
+    candidatas.sort(key=lambda x: x[0])
+    return [h for _, h in candidatas[:limite]]
+
+
+def es_peticion_mejores(texto: str) -> bool:
+    return bool(_RE_MEJORES.search(texto or ""))
+
+
+def ranking_mejores(
+    catalogo: list[dict[str, Any]], consulta: str = "", n: int = 5
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Las historias con mejor nota media entre las que tienen reseñas (empate: más reseñas primero).
+    Si, además, piden un tema ("las mejores de terror"), solo entran las que encajan con él mientras
+    haya alguna. Retorna (historias, filtrado_por_tema).
+    """
+    reseñadas = [h for h in catalogo if h.get("nota_media") is not None and (h.get("num_resenas") or 0) > 0]
+    claves = [c for c in palabras_clave(consulta) if c not in _PALABRAS_RANKING]
+    filtrado = False
+    if claves:
+        del_tema = [h for h in reseñadas if puntuar(h, claves) > 0]
+        if del_tema:
+            reseñadas, filtrado = del_tema, True
+    reseñadas.sort(key=lambda h: (-float(h["nota_media"]), -(h.get("num_resenas") or 0), h.get("id", 0)))
+    return reseñadas[:n], filtrado
+
+
 def es_peticion_recomendacion(texto: str) -> bool:
     return bool(_RE_RECOMENDAR.search(texto or ""))
 

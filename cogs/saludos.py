@@ -30,6 +30,7 @@ import comun
 import hugging_face
 import memoria as mem
 import personalidad as ribby
+import recomendador as rec
 from ai_providers import ProviderManager, SystemPrompt
 
 log = logging.getLogger("bot-literario.saludos")
@@ -568,6 +569,10 @@ class Saludos(commands.Cog):
             "de tu biblioteca. Úsala cuando alguien quiera algo para leer aunque no lo pida con esas palabras "
             "(\"estoy aburrido\", \"¿algo como lo de ayer?\"). Tu texto debe presentar la recomendación sin inventar "
             "títulos: los títulos salen en las tarjetas.\n"
+            "  Si piden SUS historias o las de otra persona (\"las que yo escribí\"), usa la marca con esa petición: el "
+            "sistema muestra las historias vinculadas a esa persona.\n"
+            "  Si piden las MEJORES historias (10/10, 9/10, \"las mejor puntuadas\"), usa esta marca con esa petición: "
+            "el sistema muestra las que tienen mejores reseñas REALES de la comunidad. No inventes notas ni títulos.\n"
             "- [[REACCION: emoji]] → reaccionas al mensaje con ese emoji (por ejemplo [[REACCION: 📚]]). Puede ir "
             "junto a tu respuesta o sola.\n"
             "- [[SILENCIO]] → no dices nada. Úsala SOLO cuando te avisen de que nadie te ha hablado directamente y no "
@@ -1396,6 +1401,9 @@ class Saludos(commands.Cog):
                     embeds, intro = await self._recomendar_desde_charla(message, marcas.recomendar)
                     if embeds and not response_text:
                         response_text = intro
+                    elif embeds and rec.es_peticion_mejores(marcas.recomendar):
+                        # El ranking real (con notas y nº de reseñas) va siempre, junto a lo que ella diga
+                        response_text = f"{response_text}\n\n{intro}"[:_MAX_CARACTERES_DISCORD]
 
                 if marcas.silencio and not embeds:
                     response_text = ""

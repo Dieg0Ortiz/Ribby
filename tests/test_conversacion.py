@@ -291,5 +291,83 @@ class TestAccionInicial(unittest.TestCase):
         self.assertEqual(msgs[1]["content"], "Hola, Tainy")
 
 
+class TestMejoresResenadas(unittest.TestCase):
+    CAT = [
+        dict(id=1, titulo="A", nota_media=5.0, num_resenas=1, tags=["terror"]),
+        dict(id=2, titulo="B", nota_media=4.5, num_resenas=4, tags=["romance"]),
+        dict(id=3, titulo="C", nota_media=5.0, num_resenas=3, tags=["romance"]),
+        dict(id=4, titulo="D", nota_media=None, num_resenas=0, tags=[]),
+        dict(id=5, titulo="E", nota_media=3.0, num_resenas=2, tags=["terror"]),
+    ]
+
+    def test_intencion(self):
+        for t in ["podrías compartir ejemplos de historias 10/10 o 9/10?", "dame las mejor puntuadas",
+                  "cuáles son las más valoradas", "las mejores historias de la comarca", "historias de 5 estrellas"]:
+            self.assertTrue(rec.es_peticion_mejores(t), t)
+        for t in ["recomiéndame algo de terror", "esa historia es la mejor que leí", "tengo 10 años", "hola"]:
+            self.assertFalse(rec.es_peticion_mejores(t), t)
+
+    def test_orden_y_solo_con_resenas(self):
+        titulos = [h["titulo"] for h in rec.ranking_mejores(self.CAT, "historias 10/10")[0]]
+        self.assertEqual(titulos, ["C", "A", "B", "E"])      # Misma nota: antes la de más reseñas; sin reseñas, fuera
+        self.assertEqual(len(rec.ranking_mejores(self.CAT, "", n=2)[0]), 2)
+
+    def test_con_tema(self):
+        historias, filtrado = rec.ranking_mejores(self.CAT, "las mejores de terror")
+        self.assertEqual([h["titulo"] for h in historias], ["A", "E"])
+        self.assertTrue(filtrado)
+        historias, filtrado = rec.ranking_mejores(self.CAT, "las mejores de ciencia ficcion")  # Sin ninguna del tema
+        self.assertFalse(filtrado)
+        self.assertEqual(historias[0]["titulo"], "C")
+
+
+class TestSelectorDeHistorias(unittest.TestCase):
+    CAT = (
+        [dict(id=i, titulo=f"Reto {i}", participante_id=i, fuente="reto", autor_nombre="Ana") for i in range(1, 31)]
+        + [dict(id=100 + i, titulo=f"Wattpad {i}", wattpad_id=str(i), fuente="wattpad", lecturas=1000 - i,
+                autor_nombre="Bob", tags=["terror"] if i == 3 else []) for i in range(1, 21)]
+    )
+
+    def test_sin_texto_mezcla_wattpad_y_retos(self):
+        v = rec.buscar_para_autocompletar(self.CAT, "")
+        self.assertEqual(len(v), 25)
+        self.assertGreaterEqual(sum(1 for h in v if not rec.es_reto(h)), 12)   # Antes salían solo retos
+        self.assertGreaterEqual(sum(1 for h in v if rec.es_reto(h)), 12)
+
+    def test_busca_por_titulo_autor_y_etiqueta(self):
+        self.assertEqual(rec.buscar_para_autocompletar(self.CAT, "wattpad 1")[0]["titulo"], "Wattpad 1")
+        self.assertEqual(len(rec.buscar_para_autocompletar(self.CAT, "bob")), 20)
+        self.assertEqual([h["titulo"] for h in rec.buscar_para_autocompletar(self.CAT, "terror")], ["Wattpad 3"])
+        self.assertEqual(rec.buscar_para_autocompletar(self.CAT, "zzzz"), [])
+
+    def test_catalogo_chico_y_filtro_de_fuente(self):
+        self.assertEqual(len(rec.buscar_para_autocompletar(self.CAT[:3], "")), 3)
+        self.assertEqual(len(rec.filtrar_fuente(self.CAT, "reto")), 30)
+        self.assertEqual(len(rec.filtrar_fuente(self.CAT, "wattpad")), 20)
+        self.assertEqual(len(rec.filtrar_fuente(self.CAT, "todas")), 50)
+
+
+class TestHistoriasPropias(unittest.TestCase):
+    def test_intencion_propias(self):
+        for t in ["Recomiendame historias que yo haya escrito", "muéstrame mis historias", "cuáles son las historias mías",
+                  "las que escribí yo", "historias de mi autoría", "dame fics escritos por mí", "historias que he escrito"]:
+            self.assertTrue(rec.es_peticion_propias(t), t)
+        for t in ["recomiéndame historias que yo no haya escrito", "algo que no sean mías", "algo que yo haya leído",
+                  "recomiéndame un fic de terror", "hola"]:
+            self.assertFalse(rec.es_peticion_propias(t), t)
+
+    def test_historias_de_otra_persona(self):
+        self.assertTrue(rec.es_peticion_de_autor("muéstrame las historias de Ori"))
+        self.assertTrue(rec.es_peticion_de_autor("los fics escritos por Ori"))
+        self.assertFalse(rec.es_peticion_de_autor("hola Ribby"))
+
+    def test_historias_de_autor(self):
+        cat = [dict(id=1, autor_discord="5", lecturas=10), dict(id=2, autor_discord=7, lecturas=99),
+               dict(id=3, autor_discord="5", lecturas=500), dict(id=4, autor_discord=None)]
+        self.assertEqual([h["id"] for h in rec.historias_de_autor(cat, 5)], [3, 1])   # Las más leídas primero
+        self.assertEqual([h["id"] for h in rec.historias_de_autor(cat, "7")], [2])    # Vale id como número o texto
+        self.assertEqual(rec.historias_de_autor(cat, 99), [])
+
+
 if __name__ == "__main__":
     unittest.main()

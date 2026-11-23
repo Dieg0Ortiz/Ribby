@@ -134,7 +134,7 @@ Cuanto más hablas con Ribby, más te conoce: recuerda lo que le cuentas y cómo
 3. `/reto info`: Abre el libro interactivo para ver las obras inscritas y descargar los PDFs.
 4. `/reto historial`: Abre el archivo de eventos pasados.
 5. `/help`: Muestra este manual de usuario.
-6. `/biblioteca recomendar [peticion]`: Ribby te recomienda historias.
+6. `/biblioteca recomendar [peticion]`: Ribby te recomienda historias. `/biblioteca explorar`: recorre todas las historias (Wattpad y retos) por páginas. `/biblioteca mejores [tema]`: las mejor puntuadas en las reseñas de la comunidad (también si se lo preguntas por mención: "las historias 10/10").
 7. `/biblioteca agregar [link]`: Añade una historia de Wattpad a la biblioteca.
 8. `/biblioteca ver [historia]`: Muestra la ficha de una historia.
 9. `/biblioteca etiquetar [historia] [etiquetas]` y `/biblioteca resumir [historia]`: Completa los datos de una historia.

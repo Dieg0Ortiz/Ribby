@@ -23,6 +23,15 @@ No hace falta escribirlo perfecto: entiende erratas y sinónimos. Te enseñará 
 
 También puedes usar `/biblioteca recomendar`.
 
+### ✍️ Tus historias
+Pídele *"@Ribby muéstrame mis historias"* o *"historias que yo haya escrito"* y te enseña las **tuyas**, las de tu Wattpad vinculado y las de tus retos, con su nota si tienen reseñas. También puedes pedirle las de otra persona mencionándola: *"@Ribby las historias de @Ori"*.
+
+### 📚 Explora toda la biblioteca
+Con `/biblioteca explorar` recorres **todas** las historias de Ribby, de Wattpad y de los retos, por páginas, y abres la ficha de la que elijas. Puedes filtrar solo Wattpad o solo retos con el botón. Además, al escribir el nombre de una historia en cualquier comando (`resenar`, `ver`…), el desplegable ahora mezcla Wattpad y retos (📖 / 🏆) y busca también por autor y etiquetas.
+
+### 🏆 Las mejor puntuadas
+Pregúntale por las historias **10/10, 9/10, "las mejores"** o usa `/biblioteca mejores` (opcional: un tema, como `romance`). Ribby no opina a ojo: te enseña las que tienen **mejor nota en las reseñas reales** de la comunidad, con su nota y su número de reseñas. Las reseñas van de 1 a 5 ⭐, así que un 10/10 es un 5. Solo entran las que ya tienen reseñas: ¡reseña las que te gusten!
+
 ### Pásale historias
 ¿Leíste algo buenísimo de alguien de La Comarca? Menciónala con el enlace de Wattpad:
 

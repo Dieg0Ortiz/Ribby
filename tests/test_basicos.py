@@ -627,7 +627,7 @@ class TestCargaDeCogs(unittest.TestCase):
 
         nombres = asyncio.run(cargar())
         for esperado in ["evento crear", "evento iniciar_votacion", "votar", "reto info", "help", "admin_help",
-                         "participante_registrar", "biblioteca recomendar", "biblioteca agregar",
+                         "participante_registrar", "biblioteca recomendar", "biblioteca agregar", "biblioteca explorar", "biblioteca mejores",
                          "ribby corazones", "ribby cita", "ribby regalar", "ribby mision", "ribby evento",
                          "ribby logros", "ribby cumpleanos", "ribby avisos", "ribby canal", "biblioteca resenar",
                          "ribby historia", "ribby quiz", "biblioteca seguir", "biblioteca autor",
