@@ -498,12 +498,23 @@ class CitaAventuraView(_SoloAutor):
         self.terminada = False
         self._ocupada = False
         self.message: Optional[discord.Message] = None
+        self.anterior: Optional[tuple[str, list]] = None  # (lo que elegiste, reacción de Ribby) para no perderla
         self._botones()
+
+    _SEPARADOR = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+    def _bloque_anterior(self) -> str:
+        """Tu última elección y cómo reaccionó Ribby (se queda arriba de la escena siguiente)."""
+        if not self.anterior:
+            return ""
+        eleccion, reaccion = self.anterior
+        return f"**Tú:** {eleccion}\n\n{ct.formatear(reaccion, narracion_cursiva=True)}\n\n{self._SEPARADOR}\n\n"
 
     def embed_escena(self) -> discord.Embed:
         e = self.escena
         opciones = "\n".join(f"{self.LETRAS[i]}  {o['texto']}" for i, o in enumerate(e["opciones"]))
-        descripcion = f"{e['texto']}\n\n**{e['pregunta'] or '¿Qué haces?'}**\n\n{opciones}"
+        narracion = ct.formatear(e.get("bloques") or ct.bloques_de(e["texto"], ct.LIMITES["texto"]))
+        descripcion = f"{self._bloque_anterior()}{narracion}\n\n**{e['pregunta'] or '¿Qué haces?'}**\n\n{opciones}"
         embed = discord.Embed(title=self.plan["titulo"], description=descripcion[:4096], color=COLOR_ROMANCE)
         reto = " · 🧩 Reto" if self.numero == self.plan["escena_reto"] else ""
         final = " · ✨ Momento clave" if self.numero == self.plan["total"] else ""
@@ -535,10 +546,12 @@ class CitaAventuraView(_SoloAutor):
             })
             self.efectos.append(opcion["efecto"])
             ultima = self.numero >= self.plan["total"]
+            self.anterior = (opcion["texto"], opcion.get("reaccion_bloques") or ct.bloques_de(opcion["reaccion"], ct.LIMITES["reaccion"]))
+            espera = ("La tarde llega a su fin…" if self.plan.get("familiar") else "La cita llega a su fin…") if ultima \
+                else "Ribby piensa en lo que viene…"
             reaccion = discord.Embed(
                 title=self.plan["titulo"],
-                description=f"**Tú:** {opcion['texto']}\n\n**Ribby:** {opcion['reaccion']}\n\n"
-                            f"*{'…' if not ultima else ('La tarde llega a su fin…' if self.plan.get('familiar') else 'La cita llega a su fin…')}*",
+                description=f"{self._bloque_anterior()}*{espera}* ⏳",
                 color=COLOR_ROMANCE,
             )
             reaccion.set_footer(text=f"Escena {self.numero} de {self.plan['total']}")
@@ -579,7 +592,7 @@ class CitaAventuraView(_SoloAutor):
         titulos = ct.TITULO_DESENLACE_FAMILIA if self.plan.get("familiar") else ct.TITULO_DESENLACE
         embed = discord.Embed(
             title=f"{titulos[desenlace]}  ·  {self.plan['titulo']}",
-            description=f"{texto_final}\n\n📔 *{recuerdo}*{_texto_logros(nuevos)}"[:4096],
+            description=f"{self._bloque_anterior()}{texto_final}\n\n📔 *{recuerdo}*{_texto_logros(nuevos)}"[:4096],
             color=COLOR_ROMANCE if corazones > 0 else config.COLOR_ADVERTENCIA,
         )
         if self.efectos:
@@ -718,6 +731,7 @@ class Afinidad(commands.Cog):
             # La caché queda con lo recién guardado (o se olvida si el guardado falló)
             self.invalidar_caches(usuario.id, pareja=bool(estado.get("es_pareja")) or era_pareja)
         guardado = dict(copy.deepcopy(estado), usuario_discord_id=str(usuario.id), nombre_display=usuario.display_name)
+        guardado.pop("es_creador", None)  # No se guarda en la BD: se recalcula en cada carga (puede cambiar en pruebas)
         self._cache("afinidad")[(comun.en_prueba(), str(usuario.id))] = (monotonic(), guardado)
 
     async def _ocupada_por_otro(self, usuario_id: int) -> bool:
@@ -1207,7 +1221,7 @@ class Afinidad(commands.Cog):
             "desastre": "Ribby suspira... y acaba riéndose. \"Ha sido un desastre. Pero un desastre contigo.\" 💥",
             "a_medias": "Ribby se queda esperando un rato más antes de volver sola a la biblioteca. 🕯️",
         }[desenlace]
-        return respaldo, f"Ribby recuerda la cita «{plan['titulo']}»."
+        return ct.formatear(ct.bloques_de(respaldo, ct.LIMITES["final"])), f"Ribby recuerda la cita «{plan['titulo']}»."
 
     # ── Generación de mensajes propios (iniciativa, cumpleaños, aniversarios) ──
 

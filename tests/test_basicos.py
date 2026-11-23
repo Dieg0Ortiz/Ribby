@@ -450,7 +450,12 @@ class TestModoPruebas(unittest.TestCase):
         self.assertFalse(comun.es_creador(NS(id=5, name="peso_pluma__.")))
         self.assertTrue(comun.creador_activo(tainy))
         comun.activar_modo_global(True)
-        self.assertFalse(comun.creador_activo(tainy))  # En pruebas es un usuario normal
+        self.assertTrue(comun.creador_activo(tainy))   # En pruebas sigue siendo "papá" por defecto…
+        comun.fijar_creador_familia_en_pruebas(False)
+        self.assertFalse(comun.creador_activo(tainy))  # …salvo que elija probar como un usuario normal
+        comun.activar_modo_global(False)
+        self.assertTrue(comun.creador_activo(tainy))   # Fuera de pruebas, siempre es su creador
+        comun.fijar_creador_familia_en_pruebas(True)
 
     def test_afinidad_del_creador(self):
         import afinidad as af

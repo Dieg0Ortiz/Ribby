@@ -142,5 +142,38 @@ class TestTardePadreHija(unittest.TestCase):
         self.assertTrue(ct.barra_quimica(1.0, familiar=True).startswith("💛"))
 
 
+class TestDialogos(unittest.TestCase):
+    def test_partes_separadas(self):
+        bloques = ct.bloques_de([{"narracion": "Te mira."}, {"ribby": "«Hola»"}, {"narracion": "Sonríe."}], 500)
+        self.assertEqual(bloques, [("narracion", "Te mira."), ("ribby", "Hola"), ("narracion", "Sonríe.")])
+        texto = ct.formatear(bloques)
+        self.assertIn("> 🎀 **Ribby:** «Hola»", texto)
+        self.assertTrue(texto.startswith("Te mira."))
+
+    def test_formato_antiguo_con_comillas(self):
+        bloques = ct.bloques_de('Ribby gira la llave. "No mires así", murmura, aunque se sonroja.', 500)
+        self.assertEqual(bloques, [("narracion", "Ribby gira la llave."), ("ribby", "No mires así"),
+                                   ("narracion", "Aunque se sonroja.")])
+        # Una frase de verdad tras un diálogo no se borra
+        self.assertIn(("narracion", "Dice que no."), ct.bloques_de('"Hola." Dice que no.', 500))
+
+    def test_reaccion_gesto_y_dice(self):
+        bloques = ct.bloques_de({"gesto": "Se sonroja", "dice": "Gracias"}, 380)
+        self.assertEqual(bloques, [("narracion", "Se sonroja."), ("ribby", "Gracias")])
+        self.assertEqual(ct.formatear(bloques, narracion_cursiva=True), "*Se sonroja.*\n\n> 🎀 **Ribby:** «Gracias»")
+        self.assertEqual(ct.plano(bloques), "Se sonroja. Ribby: «Gracias»")
+
+    def test_escena_con_partes_y_final(self):
+        datos = {"escena": {"partes": [{"narracion": "Llueve."}, {"ribby": "Me gusta la lluvia"}], "pregunta": "¿?",
+                            "opciones": [{"texto": "a", "efecto": 1, "reaccion": {"gesto": "Sonríe", "dice": "Sí"}},
+                                         {"texto": "b", "efecto": 0, "reaccion": "Hm."}]}}
+        escena = ct.validar_escena(datos)
+        self.assertEqual(escena["bloques"][1], ("ribby", "Me gusta la lluvia"))
+        self.assertIn("Ribby: «Me gusta la lluvia»", escena["texto"])  # Lo que ve la IA en el historial
+        self.assertTrue(all(o["reaccion_bloques"] for o in escena["opciones"]))
+        final, recuerdo = ct.parsear_final(json.dumps({"final": [{"narracion": "Fin"}, {"ribby": "Repetimos"}], "recuerdo": "R"}))
+        self.assertIn("> 🎀 **Ribby:** «Repetimos»", final)
+
+
 if __name__ == "__main__":
     unittest.main()

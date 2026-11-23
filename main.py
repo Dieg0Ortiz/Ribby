@@ -8,6 +8,7 @@ servidor web mínimo para que las plataformas gratuitas no apaguen el proceso.
 import asyncio
 import logging
 import os
+import signal
 import sys
 
 import aiohttp
@@ -134,6 +135,18 @@ async def main() -> int:
                 log.exception(f"  ❌  Error cargando {cog}: {e}")
 
         runner = await start_web_server()
+
+        # Railway/Docker apagan el contenedor con SIGTERM (p. ej. al redesplegar): se cierra Ribby
+        # ordenadamente para que se desconecte de Discord enseguida y deje de figurar como conectada.
+        bucle = asyncio.get_running_loop()
+        for senal in (signal.SIGTERM, signal.SIGINT):
+            try:
+                bucle.add_signal_handler(senal, lambda s=senal: (
+                    log.info(f"  🛑  Señal {s.name} recibida: cerrando Ribby..."),
+                    asyncio.ensure_future(bot.close()),
+                ))
+            except (NotImplementedError, RuntimeError):  # Windows
+                pass
 
         try:
             max_intentos = 10

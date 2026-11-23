@@ -1824,3 +1824,10 @@ async def latido_instancia(pool: Any, instancia: str) -> list[tuple[str, datetim
             f"instancia:{instancia}",
         )
         return [(r["clave"].split(":", 1)[1], r["fecha"]) for r in rows]
+
+
+async def borrar_latido(pool: Any, instancia: str) -> None:
+    """Al apagarse, la copia deja de figurar como conectada (evita falsas alarmas tras un redespliegue)."""
+    real = getattr(pool, "real", pool)
+    async with real.acquire() as conn:
+        await conn.execute("DELETE FROM public.ribby_config WHERE clave = $1", f"instancia:{instancia}")

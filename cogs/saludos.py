@@ -794,7 +794,8 @@ class Saludos(commands.Cog):
             if otras:
                 log.warning(
                     f"⚠️ HAY OTRA COPIA DE RIBBY CONECTADA ({', '.join(self.otras_instancias)}); esta es {INSTANCIA}. "
-                    "Apaga la que sobre: si no, puede haber respuestas duplicadas."
+                    "Si acabas de desplegar, es normal durante unos minutos (la copia vieja aún no se ha apagado). "
+                    "Si sigue apareciendo, apaga la que sobre."
                 )
             if self.latido.current_loop % 60 == 0:
                 await database.limpiar_mensajes_atendidos(self.db)
@@ -812,6 +813,10 @@ class Saludos(commands.Cog):
     async def cog_unload(self):
         self.guardar_relaciones.cancel()
         self.latido.cancel()
+        try:  # Se borra de la lista de copias conectadas (al apagarse o redesplegar)
+            await asyncio.wait_for(database.borrar_latido(self.db, INSTANCIA), timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _reclamar(self, message: discord.Message) -> bool:
         """Solo una copia del bot atiende cada mensaje (si la BD falla, se atiende igualmente)."""
@@ -886,7 +891,7 @@ class Saludos(commands.Cog):
         async def describir(uid: int, nombre: str) -> str:
             partes = [nombre]
             apodo = self._CO_LIDERES.get(uid)
-            if comun.es_creador_id(uid):
+            if comun.creador_activo(uid):
                 partes.append("es Tainy, tu creador (como tu padre)")
             elif uid == _ID_LIDER:
                 partes.append("es FunnyJMystery, el líder de La Comarca")
@@ -896,7 +901,7 @@ class Saludos(commands.Cog):
                 seguro(database.obtener_afinidad(self.db, uid), None),
                 seguro(database.obtener_memoria_usuario(self.db, uid), None),
             )
-            if estado and not comun.es_creador_id(uid):
+            if estado and not comun.creador_activo(uid):
                 ocupada = bool(pareja and pareja["usuario_discord_id"] != str(uid))
                 partes.append(f"para ti es: {afinidad.NIVELES[afinidad.nivel(estado, ocupada)][0]}")
             elif not estado:

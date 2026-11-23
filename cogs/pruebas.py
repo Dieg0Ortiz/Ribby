@@ -35,6 +35,7 @@ log = logging.getLogger("bot-literario.pruebas")
 
 COLOR_PRUEBAS = 0x22D3EE
 _CLAVE = "modo_prueba:global"
+_CLAVE_CREADOR_NORMAL = "modo_prueba:creador_normal"  # Si existe, en pruebas Tainy es un usuario normal
 
 # Corazones con los que se deja cada nivel (y coqueteos para poder superar "mejor amigo")
 _NIVELES_PRUEBA = {
@@ -59,6 +60,8 @@ class Pruebas(commands.Cog):
             comun.activar_modo_global(bool(activo))
             if activo:
                 log.warning("🧪 Ribby arranca en MODO DE PRUEBAS (los datos reales no se tocan)")
+            with comun.contexto_real():
+                comun.fijar_creador_familia_en_pruebas(not await database.config_obtener(self.db, _CLAVE_CREADOR_NORMAL))
         except Exception as e:  # noqa: BLE001
             log.warning(f"No se pudo cargar el modo de pruebas: {e}")
 
@@ -218,11 +221,30 @@ class Pruebas(commands.Cog):
     @grupo.command(name="nivel", description="Pon tu relación con Ribby en un nivel concreto")
     @app_commands.describe(nivel="Nivel al que saltar")
     @app_commands.choices(nivel=[app_commands.Choice(name=af.NIVELES[n][0] + (" (secreto)" if n == "enamorada" else ""), value=n)
-                                 for n in _NIVELES_PRUEBA])
+                                 for n in _NIVELES_PRUEBA]
+                          + [app_commands.Choice(name="👨‍👧 Familia (solo el creador)", value="familia")])
     async def nivel(self, interaction: discord.Interaction, nivel: app_commands.Choice[str]):
         if not await self._exigir_modo(interaction):
             return
         romance = self._romance()
+        if comun.es_creador_id(interaction.user.id):
+            # El creador elige: ser "papá" también en pruebas, o probar como un usuario normal
+            familia = nivel.value == "familia"
+            comun.fijar_creador_familia_en_pruebas(familia)
+            with comun.contexto_real():
+                if familia:
+                    await database.config_borrar(self.db, _CLAVE_CREADOR_NORMAL)
+                else:
+                    await database.config_guardar(self.db, _CLAVE_CREADOR_NORMAL, "1")
+            romance.invalidar_caches(interaction.user.id)  # type: ignore[union-attr]
+            if familia:
+                return await interaction.response.send_message(
+                    "👨‍👧 Vuelves a ser **su papá**, también en pruebas: cariño de familia al máximo, nada romántico, "
+                    "y `/ribby cita` es una tarde padre-hija. (Elige otro nivel para probar como un usuario normal.)",
+                    ephemeral=True,
+                )
+        elif nivel.value == "familia":
+            return await interaction.response.send_message("👨‍👧 Ese nivel es solo para Tainy, su creador.", ephemeral=True)
         estado = await romance.cargar(interaction.user.id)  # type: ignore[union-attr]
         estado.update(corazones=_NIVELES_PRUEBA[nivel.value], coqueteos=10, es_pareja=False,
                       fecha_inicio_pareja=None, fecha_maximo=None)
@@ -236,8 +258,10 @@ class Pruebas(commands.Cog):
                 )
             estado.update(es_pareja=True, fecha_inicio_pareja=af.ahora().isoformat())
         await romance.guardar(interaction.user, estado)  # type: ignore[union-attr]
+        aviso = ("\n*(Como creador: mientras no elijas «Familia», en pruebas Ribby te trata como a un usuario normal.)*"
+                 if comun.es_creador_id(interaction.user.id) else "")
         await interaction.response.send_message(
-            f"💗 Ahora Ribby te ve como **{af.NIVELES[af.nivel(estado)][0]}** ({estado['corazones']:.0f} corazones).",
+            f"💗 Ahora Ribby te ve como **{af.NIVELES[af.nivel(estado)][0]}** ({estado['corazones']:.0f} corazones).{aviso}",
             ephemeral=True,
         )
 

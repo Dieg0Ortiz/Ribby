@@ -122,9 +122,25 @@ def es_creador_id(usuario_id: Any) -> bool:
         return False
 
 
+# En pruebas, el creador sigue siendo "papá" salvo que elija probar como un usuario normal
+# (/prueba nivel con cualquier nivel que no sea "Familia"). Se guarda en ribby_config.
+_creador_familia_en_pruebas = True
+
+
+def fijar_creador_familia_en_pruebas(activo: bool) -> None:
+    global _creador_familia_en_pruebas
+    _creador_familia_en_pruebas = activo
+
+
+def creador_familia_en_pruebas() -> bool:
+    return _creador_familia_en_pruebas
+
+
 def creador_activo(usuario_id: Any) -> bool:
-    """El creador cuenta como tal salvo en modo de pruebas (ahí puede probar todo como un usuario normal)."""
-    return es_creador_id(usuario_id) and not en_prueba(int(usuario_id))
+    """¿Ribby trata a esta persona como su creador (familia, nunca romántico)?"""
+    if not es_creador_id(usuario_id):
+        return False
+    return _creador_familia_en_pruebas or not en_prueba(int(usuario_id))
 
 
 # ─────────────────────────── Permisos ───────────────────────────
